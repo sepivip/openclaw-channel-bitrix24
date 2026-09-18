@@ -1,0 +1,49 @@
+# Bitrix24 channel plugin overlay for OpenClaw.
+#
+# INERT UNTIL INCLUDED. This file is merged on top of your main docker-compose.yml
+# only when explicitly specified:
+#
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f docker-compose.bitrix24.yml \
+#     up -d
+#
+# What it adds:
+#   * a named volume `openclaw-plugins` holding the BUILT plugin
+#     (populated by scripts/sync-plugin-to-volume.sh)
+#   * a READ-ONLY mount of that volume on the gateway
+#   * two env passthroughs for the SecretInput `${...}` shorthand
+#
+# What it deliberately does NOT add: no new service, no new published port.
+# There is no inbound HTTP surface.
+#
+# Even after this overlay is included, the plugin makes NO Bitrix24 call until
+# `plugins.entries.bitrix24.enabled` AND `channels.bitrix24.enabled` are both
+# true in openclaw.json AND both secrets (webhookUrl, botToken) resolve.
+
+services:
+  openclaw-gateway:
+    volumes:
+      - openclaw-plugins:/opt/plugins:ro
+    environment:
+      # Consumed only by the SecretInput shorthand in channels.bitrix24.
+      # Empty by default: an empty value is treated as MISSING and the account
+      # refuses to start (fail-closed).
+      BITRIX24_WEBHOOK_URL: ${BITRIX24_WEBHOOK_URL:-}
+      BITRIX24_BOT_TOKEN: ${BITRIX24_BOT_TOKEN:-}
+
+  # The CLI sidecar needs the SAME mount and env: `openclaw config set/validate`
+  # run inside a fresh openclaw-cli container and check that every
+  # `plugins.load.paths` entry exists and every `${ENV}` SecretRef resolves.
+  openclaw-cli:
+    volumes:
+      - openclaw-plugins:/opt/plugins:ro
+    environment:
+      BITRIX24_WEBHOOK_URL: ${BITRIX24_WEBHOOK_URL:-}
+      BITRIX24_BOT_TOKEN: ${BITRIX24_BOT_TOKEN:-}
+
+volumes:
+  openclaw-plugins:
+    name: openclaw-plugins
+    # Created and populated by scripts/sync-plugin-to-volume.sh, not by Compose.
+    external: true

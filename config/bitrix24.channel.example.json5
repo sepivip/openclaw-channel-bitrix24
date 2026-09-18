@@ -1,0 +1,92 @@
+// EXAMPLE ONLY — documented, NOT applied.
+//
+// The `channels.bitrix24` configuration block with every switch in its safe position.
+// Nothing here is a secret: the two credentials are `${ENV}` SecretInput shorthands
+// resolved by OpenClaw core at runtime, so the real values live only in your .env file
+// (which should be gitignored and access-controlled) and never land in openclaw.json.
+
+{
+  plugins: {
+    load: {
+      // Read-only mount provided by docker-compose.bitrix24.yml
+      paths: ["/opt/plugins/bitrix24"],
+    },
+    entries: {
+      // Loads the plugin. Loading is NOT starting: the channel below is still
+      // disabled, so no account starts and no Bitrix24 call is made.
+      bitrix24: { enabled: true },
+    },
+  },
+
+  channels: {
+    bitrix24: {
+      // DISABLED. Flip to true only when you're ready to enable the channel.
+      // Nothing polls and nothing registers while false.
+      enabled: false,
+
+      // SecretInput env shorthand. Resolved by core; never stored in openclaw.json.
+      webhookUrl: "${BITRIX24_WEBHOOK_URL}",
+      botToken: "${BITRIX24_BOT_TOKEN}",
+
+      // Host gate for the REST client. The webhook host must END WITH this.
+      portalDomain: "example.bitrix24.eu",
+
+      // Default deny. There is no "open" value for this channel.
+      dmPolicy: "allowlist",
+
+      // Numeric Bitrix24 user ids only; non-numeric entries are dropped with a warning.
+      // Empty means nobody is allowed — that is the intended default.
+      allowFrom: [],
+
+      // MVP is DMs only.
+      groupPolicy: "disabled",
+
+      bot: {
+        code: "openclaw_bot",
+        name: "Assistant",
+        color: "PURPLE",
+        workPosition: "AI Assistant",
+      },
+
+      poll: {
+        idleMs: 15000,
+        activeMs: 3000,
+      },
+
+      // OFFLINE TESTS ONLY. Leave absent (or false) forever in production.
+      // Even set to true it is inert unless the process also has NODE_ENV=test
+      // or BITRIX24_ALLOW_INSECURE_HTTP=1.
+      // allowInsecureHttpForTests: false,
+    },
+  },
+}
+
+// ---------------------------------------------------------------------------
+// HOW TO APPLY (documented, not run)
+//
+// Never hand-edit openclaw.json. Apply via the CLI so the config schema, the
+// SecretInput contract and the backup path all stay intact:
+//
+//   docker compose -f docker-compose.yml -f docker-compose.bitrix24.yml \
+//     run --rm openclaw-cli config set --batch-json '{
+//       "plugins.load.paths": ["/opt/plugins/bitrix24"],
+//       "plugins.entries.bitrix24.enabled": true,
+//       "channels.bitrix24.enabled": false,
+//       "channels.bitrix24.webhookUrl": "${BITRIX24_WEBHOOK_URL}",
+//       "channels.bitrix24.botToken": "${BITRIX24_BOT_TOKEN}",
+//       "channels.bitrix24.portalDomain": "example.bitrix24.eu",
+//       "channels.bitrix24.dmPolicy": "allowlist",
+//       "channels.bitrix24.allowFrom": [],
+//       "channels.bitrix24.groupPolicy": "disabled",
+//       "channels.bitrix24.bot.code": "openclaw_bot",
+//       "channels.bitrix24.bot.name": "Assistant",
+//       "channels.bitrix24.bot.color": "PURPLE",
+//       "channels.bitrix24.bot.workPosition": "AI Assistant",
+//       "channels.bitrix24.poll.idleMs": 15000,
+//       "channels.bitrix24.poll.activeMs": 3000
+//     }'
+//
+// Enabling the channel is a SEPARATE, later, explicitly approved step:
+//
+//   ... config set --batch-json '{"channels.bitrix24.enabled": true}'
+// ---------------------------------------------------------------------------

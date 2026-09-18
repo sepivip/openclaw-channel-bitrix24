@@ -1,0 +1,14 @@
+openclaw-channel-bitrix24
+=========================
+
+This plugin implements a Bitrix24 channel for OpenClaw using the imbot.v2 API
+in fetch/poll mode (Path B), eliminating the webhook forgery risks present in
+Path A (inbound webhook receiver).
+
+This is a community plugin, not an official Bitrix24 or OpenClaw project.
+
+The plugin was extracted from a pilot implementation and sanitized for public
+release under the MIT license.
+
+Key design principle: NO inbound HTTP surface. All communication is outbound
+via polling, making webhook forgery structurally impossible.

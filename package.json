@@ -1,0 +1,47 @@
+{
+  "name": "openclaw-channel-bitrix24",
+  "version": "0.1.0",
+  "description": "Bitrix24 channel plugin for OpenClaw (imbot.v2 fetch mode)",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.9.4"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.9.4"
+    },
+    "channel": {
+      "id": "bitrix24",
+      "label": "Bitrix24",
+      "selectionLabel": "Bitrix24 (imbot.v2, fetch mode)",
+      "detailLabel": "Bitrix24 chat bot",
+      "blurb": "Polls imbot.v2.Event.get over an inbound webhook URL. No inbound HTTP surface.",
+      "markdownCapable": false,
+      "configuredState": {
+        "env": {
+          "anyOf": [
+            "BITRIX24_WEBHOOK_URL"
+          ]
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^26.5.1",
+    "openclaw": "^2026.9.4",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
+  }
+}

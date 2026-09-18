@@ -1,0 +1,7 @@
+node_modules/
+# dist/ is NOT committed: it is a build artefact.
+# `scripts/sync-plugin-to-volume.sh` copies from dist/, so run `npm run build` first.
+dist/
+*.log
+.vitest/
+coverage/
