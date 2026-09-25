@@ -220,7 +220,10 @@ export const bitrix24Plugin = createChatChannelPlugin<ResolvedBitrix24Account>({
         "Polls imbot.v2.Event.get over an inbound webhook URL. No inbound HTTP surface, no port, no tunnel.",
       markdownCapable: false,
     },
-    capabilities: { chatTypes: ["direct"] },
+    // "group" is a capability, not a permission: a group is only ever served
+    // when groupPolicy is "allowlist" AND the chat is listed in `groups`
+    // (inbound.ts), and it passes the hard guard (guard.ts).
+    capabilities: { chatTypes: ["direct", "group"] },
     configSchema: bitrix24ChannelConfigSchema,
     config: {
       listAccountIds: listBitrix24AccountIds,
@@ -274,7 +277,7 @@ export const bitrix24Plugin = createChatChannelPlugin<ResolvedBitrix24Account>({
             `webhookFp=${fingerprintSecret(prepared.webhookUrl)} ` +
             `botTokenFp=${fingerprintSecret(prepared.botToken)} ` +
             `dmPolicy=${account.dmPolicy} allowFrom=${account.allowFrom.length} ` +
-            `groupPolicy=${account.groupPolicy}`,
+            `groupPolicy=${account.groupPolicy} groups=${Object.keys(account.groups).length}`,
         );
 
         const client = buildClient({ prepared, account });

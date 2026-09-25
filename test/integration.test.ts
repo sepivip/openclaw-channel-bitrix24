@@ -442,6 +442,143 @@ describe("T-9 chunking", () => {
   });
 });
 
+describe("group chats end to end (poller -> guard -> ingress -> send)", () => {
+  /** A group ONIMBOTV2MESSAGEADD as raw JSON for the fake portal. Synthetic values. */
+  function rawGroupMessage(params: { userId: number; text: string; dialogId?: string }) {
+    const dialogId = params.dialogId ?? "chat5";
+    return {
+      type: "ONIMBOTV2MESSAGEADD",
+      date: new Date().toISOString(),
+      data: {
+        bot: { id: 777, code: "openclaw_bot" },
+        message: { id: 1, chatId: 5, authorId: params.userId, text: params.text, isSystem: false },
+        chat: {
+          id: 5,
+          dialogId,
+          name: "Fake Group",
+          type: "chat",
+          messageType: "C",
+          extranet: false,
+          containsCollaber: false,
+          entityType: "",
+        },
+        user: {
+          id: params.userId,
+          name: "Fake User",
+          bot: false,
+          extranet: false,
+          connector: false,
+          externalAuthId: "default",
+        },
+      },
+    };
+  }
+
+  const groupCfg = () => buildConfig({ groupPolicy: "allowlist", groups: { chat5: {} } });
+
+  it("answers a mention from an allowlisted user in the group, ignores the rest", async () => {
+    const client = buildClient();
+    const stateStore = createFileStateStore({ accountId: "grp", stateDir });
+    harness.replyText = "group pong";
+    // 1. mentioned + allowlisted  -> answered
+    await control("/__test/enqueue", {
+      raw: rawGroupMessage({ userId: 42, text: "[USER=777]Test Bot[/USER] ping" }),
+    });
+    // 2. not mentioned            -> ignored
+    await control("/__test/enqueue", { raw: rawGroupMessage({ userId: 42, text: "just chatting" }) });
+    // 3. mentioned, not allowlisted -> ignored
+    await control("/__test/enqueue", {
+      raw: rawGroupMessage({ userId: 999, text: "[USER=777]Test Bot[/USER] ping" }),
+    });
+    // 4. unlisted group           -> ignored
+    const last = (await control("/__test/enqueue", {
+      raw: rawGroupMessage({ userId: 42, text: "[USER=777]Test Bot[/USER] ping", dialogId: "chat6" }),
+    })) as { eventId: number };
+
+    await runPollerUntil({
+      client,
+      botId: "777",
+      cfg: groupCfg(),
+      accountId: "grp",
+      stateStore,
+      // All four events fetched and acknowledged (offset acks ids below it).
+      predicate: () => fake.state.acks.some((offset) => offset > last.eventId),
+    });
+
+    expect(harness.calls).toHaveLength(1);
+    expect(harness.calls[0]).toMatchObject({ rawText: "[USER=777]Test Bot[/USER] ping" });
+    expect(harness.calls[0]?.sessionKey).toContain(":group:chat5");
+    expect(fake.state.sent).toEqual([
+      expect.objectContaining({ dialogId: "chat5", message: "group pong", botId: "777" }),
+    ]);
+  });
+
+  it("a join event makes no Bitrix call beyond Event.get and sends nothing", async () => {
+    const client = buildClient();
+    const stateStore = createFileStateStore({ accountId: "grp-join", stateDir });
+    harness.replyText = "should never be sent";
+    await control("/__test/enqueue", {
+      raw: {
+        type: "ONIMBOTV2JOINCHAT",
+        date: new Date().toISOString(),
+        data: {
+          bot: { id: 777 },
+          dialogId: "chat5",
+          chat: { id: 5, dialogId: "chat5", type: "chat", extranet: false, containsCollaber: false },
+          user: { id: 42, name: "Fake User" },
+          language: "en",
+        },
+      },
+    });
+    await runPollerUntil({
+      client,
+      botId: "777",
+      cfg: groupCfg(),
+      accountId: "grp-join",
+      stateStore,
+      predicate: () => fake.state.acks.length > 0,
+    });
+    expect(harness.calls).toHaveLength(0);
+    expect(fake.state.sent).toHaveLength(0);
+    expect(new Set(fake.state.calls.map((call) => call.method))).toEqual(new Set(["imbot.v2.Event.get"]));
+  });
+
+  it("real DM and group event shapes (synthetic values) are answered over HTTP", async () => {
+    const { realShapeDmEvent, realShapeGroupEvent } = await import("./fixtures.js");
+    // The fake portal assigns its own numeric eventId; drop the fixture's.
+    const strip = (event: { eventId?: unknown }) => {
+      const { eventId: _eventId, ...rest } = event;
+      return rest;
+    };
+    const client = buildClient();
+    const stateStore = createFileStateStore({ accountId: "grp-real", stateDir });
+    harness.replyText = "real shape pong";
+    await control("/__test/enqueue", { raw: strip(realShapeDmEvent({ userId: 42, botId: 777, text: "hello" })) });
+    const last = (await control("/__test/enqueue", {
+      raw: strip(realShapeGroupEvent({ userId: 42, botId: 777, dialogId: "chat5" })),
+    })) as { eventId: number };
+
+    await runPollerUntil({
+      client,
+      botId: "777",
+      cfg: groupCfg(),
+      accountId: "grp-real",
+      stateStore,
+      predicate: () => fake.state.acks.some((offset) => offset > last.eventId),
+    });
+
+    expect(harness.calls.map((call) => call.rawText)).toEqual([
+      "hello",
+      "[USER=777]Assistant[/USER] how many warehouses do we have?",
+    ]);
+    expect(harness.calls[1]?.sessionKey).toContain(":group:chat5");
+    expect(fake.state.sent).toEqual([
+      expect.objectContaining({ dialogId: "42", message: "real shape pong" }),
+      expect.objectContaining({ dialogId: "chat5", message: "real shape pong" }),
+    ]);
+  });
+});
+
 describe("T-10 offset survives a restart", () => {
   it("persists the offset and does not replay after the poller is restarted", async () => {
     const client = buildClient();

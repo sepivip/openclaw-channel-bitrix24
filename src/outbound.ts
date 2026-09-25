@@ -87,8 +87,8 @@ export function markdownToBbCode(markdown: string): string {
 
   // 6. Unordered lists: plain "• " bullets. Bitrix24 chat has NO list tags —
   //    the documented BB set is b/i/u/s/size/color/url/user/chat/code/img — and
-  //    `[list]`/`[*]` rendered literally in the 2026-09-15 smoke test on the
-  //    batcave portal. Ordered lists ("1. x") are left as plain text.
+  //    `[list]`/`[*]` rendered literally in the 2026-09-15 smoke test on a
+  //    live portal. Ordered lists ("1. x") are left as plain text.
   text = text.replace(/^[ \t]*[-*][ \t]+/gm, "• ");
 
   // 7. Restore parked spans.

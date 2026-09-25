@@ -1,16 +1,25 @@
-// Inbound: envelope parsing, loop guard, SDK ingress, and the
-// `runChannelInboundEvent` adapter that starts an agent turn.
+// Inbound: envelope parsing, loop guard, hard guard, group eligibility, SDK
+// ingress, and the `runChannelInboundEvent` adapter that starts an agent turn.
 //
 // Ordering is load-bearing (design §2.2):
-//   1. event type filter        — only ONIMBOTV2MESSAGEADD can start a turn
-//   2. loop guard               — the bot's own echo never reaches policy
-//   3. group drop               — groupPolicy: "disabled" ⇒ DMs only
-//   4. SDK ingress              — core owns dmPolicy / allowFrom / pairing
-//   5. runChannelInboundEvent   — core owns classify → resolve → record → dispatch
+//   0. event type filter        — ONIMBOTV2MESSAGEADD may start a turn;
+//                                 ONIMBOTV2JOINCHAT is logged (no reply);
+//                                 everything else is ignored
+//   1. loop guard               — the bot's own echo never reaches policy
+//   2. HARD GUARD (guard.ts)    — extranet / collaber / Open Lines / external
+//                                 senders are refused, DMs and groups alike
+//   3. group eligibility        — groupPolicy "allowlist" AND listed in `groups`
+//   4. mention detection        — groups only (mentions.ts; format confirmed
+//                                 on a real v2 event)
+//   5. SDK ingress              — core owns dmPolicy / allowFrom / pairing, the
+//                                 group sender allowlist and the mention gate
+//   6. session isolation        — a group must get its own per-group session
+//   7. runChannelInboundEvent   — core owns classify → resolve → record → dispatch
 //
-// There is no hand-rolled allow decision anywhere in this file: step 4 delegates
-// to `createChannelIngressResolver`, the same core evaluator the bundled
-// Telegram channel uses (`/app/extensions/telegram/src/ingress.ts`).
+// Steps 0-4 and 6 only ever REFUSE; none of them can admit anything. Every
+// admit decision is step 5, delegated to `createChannelIngressResolver`, the
+// same core evaluator the bundled Telegram channel uses
+// (`/app/extensions/telegram/src/ingress.ts`).
 
 import {
   buildChannelInboundEventContext,
@@ -29,14 +38,62 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import type { Bitrix24Client } from "./client.js";
 import {
   BITRIX24_CHANNEL_ID,
+  BITRIX24_GROUP_DIALOG_ID_RE,
   type Bitrix24DmPolicy,
   type ResolvedBitrix24Account,
+  type ResolvedBitrix24Group,
 } from "./config-schema.js";
+import {
+  prepareBitrix24ReplyPayload,
+  renderBitrix24ReplyText,
+  warnReplyDeclined,
+  warnReplyMediaDropped,
+} from "./delivery.js";
+import { evaluateBitrix24ChatGuard, evaluateBitrix24EventGuard } from "./guard.js";
+import { detectBitrix24BotMention, type Bitrix24BotMention } from "./mentions.js";
 import { Bitrix24Error } from "./secrets.js";
 import { sendText as sendBitrix24Text, sendTyping as sendBitrix24Typing } from "./outbound.js";
 
-/** The only event that may start an agent turn in the MVP. */
+/** The only event that may start an agent turn. */
 export const BITRIX24_MESSAGE_EVENT = "ONIMBOTV2MESSAGEADD";
+
+/** Bot added to (or invited into) a chat. Logged, never answered. */
+export const BITRIX24_JOIN_EVENT = "ONIMBOTV2JOINCHAT";
+
+/**
+ * `data.chat` of `ONIMBOTV2MESSAGEADD` / `ONIMBOTV2JOINCHAT`, narrowed to what
+ * we read. Guard-relevant fields are `unknown` on purpose: guard.ts decides
+ * what shape counts as safe.
+ */
+export type Bitrix24RawChat = {
+  id?: string | number;
+  dialogId?: string | number;
+  /** `chat`, `open`, `channel`, `openChannel`, `copilot`, `thread`, `generalChannel`; DMs `private`. */
+  type?: string;
+  name?: string;
+  /** `C` chat, `O` open, `P` private, … */
+  messageType?: unknown;
+  owner?: unknown;
+  extranet?: unknown;
+  containsCollaber?: unknown;
+  /** e.g. `LINES` for Open Lines / Open Channels. */
+  entityType?: unknown;
+  entityId?: unknown;
+};
+
+/** `data.user` of `ONIMBOTV2MESSAGEADD` (the author) or `ONIMBOTV2JOINCHAT` (who added the bot). */
+export type Bitrix24RawUser = {
+  id?: string | number;
+  name?: string;
+  bot?: unknown;
+  /** Tolerated alias of `bot`. */
+  isBot?: unknown;
+  extranet?: unknown;
+  /** Open Lines connector, i.e. an external customer. */
+  connector?: unknown;
+  /** `default`, `bot`, `email`, `replica`, … */
+  externalAuthId?: unknown;
+};
 
 /**
  * `imbot.v2.Event.get` envelope, narrowed to what we read.
@@ -65,8 +122,11 @@ export type Bitrix24RawEvent = {
       text?: string;
       isSystem?: boolean;
     };
-    chat?: { id?: string | number; dialogId?: string | number; type?: string; name?: string };
-    user?: { id?: string | number; name?: string; bot?: boolean; isBot?: boolean };
+    chat?: Bitrix24RawChat;
+    user?: Bitrix24RawUser;
+    /** `ONIMBOTV2JOINCHAT` carries the dialog id at the top level of `data`. */
+    dialogId?: string | number;
+    language?: string;
   };
 };
 
@@ -76,11 +136,11 @@ export type NormalizedBitrix24Event = {
   /** `eventId` → turn id / idempotency key. */
   id: string;
   timestampMs: number | undefined;
-  /** `data.message.text` → rawText / textForAgent. */
+  /** `data.message.text` → rawText. For groups the agent gets the mention-stripped text. */
   text: string;
   /** `data.chat.dialogId` → conversation id (`{userId}` for DMs, `chat{id}` for groups). */
   conversationId: string;
-  /** `String(data.user.id)` → sender stable id, matched against `allowFrom`. */
+  /** `data.user.id`, falling back to `data.message.authorId` → sender stable id. */
   senderStableId: string;
   senderName: string | undefined;
   senderIsBot: boolean;
@@ -99,6 +159,14 @@ function asId(value: unknown): string {
   return String(value).trim();
 }
 
+/** An id or enum value that is safe to put in a log line; anything else is masked. */
+function logToken(value: string | undefined): string {
+  if (!value) {
+    return "?";
+  }
+  return /^[A-Za-z0-9_.:-]{1,64}$/.test(value) ? value : "<invalid>";
+}
+
 /** Event name, tolerating the `event` alias. */
 export function bitrix24EventName(raw: Bitrix24RawEvent): string {
   return (typeof raw.type === "string" ? raw.type : (raw.event ?? "")).trim().toUpperCase();
@@ -111,13 +179,13 @@ export function bitrix24EventName(raw: Bitrix24RawEvent): string {
  * for personal chats — `{userId}`", so a purely numeric dialogId is a DM. The
  * `chat.type` string is used first when it is one of the known values.
  */
-export function resolveBitrix24ChatKind(chat: Bitrix24RawEvent["data"] extends infer _ ? NonNullable<Bitrix24RawEvent["data"]>["chat"] : never): Bitrix24ChatKind {
+export function resolveBitrix24ChatKind(chat: Bitrix24RawChat | undefined): Bitrix24ChatKind {
   const type = typeof chat?.type === "string" ? chat.type.trim().toLowerCase() : "";
   if (type === "private" || type === "user" || type === "dialog") {
     return "direct";
   }
   if (type) {
-    // "chat", "group", "lines", "call", "sonet_group", … are all non-direct.
+    // "chat", "open", "channel", "lines", … are all non-direct.
     return "group";
   }
   const dialogId = asId(chat?.dialogId);
@@ -225,7 +293,7 @@ function logAt(log: Bitrix24Log | undefined, level: keyof Bitrix24Log, text: str
 export type Bitrix24InboundDeps = {
   /** Live config snapshot. Re-read per batch so a hot reload is picked up. */
   getConfig: () => OpenClawConfig;
-  /** Live account projection (dmPolicy, allowFrom, groupPolicy, bot identity). */
+  /** Live account projection (dmPolicy, allowFrom, groupPolicy, groups, bot identity). */
   getAccount: () => ResolvedBitrix24Account;
   accountId: string;
   client: Bitrix24Client;
@@ -242,32 +310,59 @@ export type Bitrix24InboundDeps = {
   abortSignal?: AbortSignal;
 };
 
+export type Bitrix24DropReason =
+  | "not_a_message"
+  | "join_chat"
+  | "loop_guard"
+  | "unmappable"
+  | "guard_refused"
+  | "group_disabled"
+  | "group_not_listed"
+  | "bot_id_unknown"
+  | "not_mentioned"
+  | "blocked"
+  | "pairing"
+  | "group_session_not_isolated";
+
 export type Bitrix24InboundOutcome =
   | {
       status: "dropped";
-      reason: "not_a_message" | "loop_guard" | "unmappable" | "group_disabled" | "blocked" | "pairing";
+      reason: Bitrix24DropReason;
+      /** Machine-readable sub-reason (guard rule or core ingress reason code). */
+      detail?: string;
     }
   | { status: "dispatched"; dispatched: boolean; agentId: string; sessionKey: string };
 
-/** Build the turn plan handed back to core from `adapter.resolveTurn`. */
-async function buildTurnPlan(params: {
-  deps: Bitrix24InboundDeps;
-  cfg: OpenClawConfig;
-  normalized: NormalizedBitrix24Event;
-  ingress: unknown;
-}): Promise<ChannelInboundTurnPlan<"provider_message_sending">> {
-  const { deps, cfg, normalized } = params;
-  const accountId = deps.accountId;
-  const peerKind = normalized.chatKind;
-  const peerId = peerKind === "direct" ? normalized.senderStableId : normalized.conversationId;
+export type Bitrix24Route = {
+  agentId: string;
+  accountId: string;
+  sessionKey: string;
+  mainSessionKey: string;
+  dmScope?: NonNullable<ReturnType<typeof resolveAgentRoute>["dmScope"]>;
+  peer: { kind: Bitrix24ChatKind; id: string };
+};
 
+/**
+ * Resolve the agent and session for one conversation.
+ *
+ * DM peer = the sender id; group peer = the group dialog id (`chat<N>`), so a
+ * group gets `agent:<agent>:bitrix24:group:chat<N>` under core's default
+ * `session.groupScope: "per-group"`, separate from every DM key.
+ */
+export function resolveBitrix24Route(params: {
+  cfg: OpenClawConfig;
+  accountId: string;
+  chatKind: Bitrix24ChatKind;
+  conversationId: string;
+  senderStableId: string;
+}): Bitrix24Route {
+  const { cfg, accountId } = params;
+  const peer = {
+    kind: params.chatKind,
+    id: params.chatKind === "direct" ? params.senderStableId : params.conversationId,
+  };
   // bindings[] decide the agent. `matchedBy` records which rule won.
-  const route = resolveAgentRoute({
-    cfg,
-    channel: BITRIX24_CHANNEL_ID,
-    accountId,
-    peer: { kind: peerKind, id: peerId },
-  });
+  const route = resolveAgentRoute({ cfg, channel: BITRIX24_CHANNEL_ID, accountId, peer });
   const sessionKey =
     route.sessionKey ||
     buildAgentSessionKey({
@@ -275,13 +370,60 @@ async function buildTurnPlan(params: {
       ...(cfg.session?.mainKey ? { mainKey: cfg.session.mainKey } : {}),
       channel: BITRIX24_CHANNEL_ID,
       accountId,
-      peer: { kind: peerKind, id: peerId },
+      peer,
       ...(route.dmScope ? { dmScope: route.dmScope } : {}),
       ...(cfg.session?.identityLinks ? { identityLinks: cfg.session.identityLinks } : {}),
     });
+  return {
+    agentId: route.agentId,
+    accountId: route.accountId,
+    sessionKey,
+    mainSessionKey: route.mainSessionKey,
+    ...(route.dmScope ? { dmScope: route.dmScope } : {}),
+    peer,
+  };
+}
 
+/**
+ * True only when a group's session is its own: not the agent's main session
+ * and keyed by this group's dialog id. `session.groupScope: "main"` (or a
+ * binding override to it) would fold group turns into the main session, which
+ * a DM may share; that is refused rather than dispatched.
+ */
+export function isIsolatedBitrix24GroupSession(route: Bitrix24Route, dialogId: string): boolean {
+  const key = route.sessionKey.trim().toLowerCase();
+  if (!key || key === route.mainSessionKey.trim().toLowerCase()) {
+    return false;
+  }
+  return key.endsWith(`:group:${dialogId.trim().toLowerCase()}`);
+}
+
+/** Mention facts handed to core's context for a group turn. */
+type Bitrix24MentionAccess = {
+  canDetectMention: boolean;
+  wasMentioned: boolean;
+  requireMention: boolean;
+  effectiveWasMentioned?: boolean;
+};
+
+/** Build the turn plan handed back to core from `adapter.resolveTurn`. */
+async function buildTurnPlan(params: {
+  deps: Bitrix24InboundDeps;
+  cfg: OpenClawConfig;
+  normalized: NormalizedBitrix24Event;
+  route: Bitrix24Route;
+  /** Text for the agent and for command parsing (mention-stripped in groups). */
+  agentText: string;
+  mentions: Bitrix24MentionAccess | undefined;
+  ingress: unknown;
+}): Promise<ChannelInboundTurnPlan<"provider_message_sending">> {
+  const { deps, cfg, normalized, route } = params;
+  const accountId = deps.accountId;
+  const peerKind = normalized.chatKind;
+  const sessionKey = route.sessionKey;
   const dialogId = normalized.conversationId;
   const botId = deps.getBotId();
+  const warn = (message: string) => logAt(deps.log, "warn", message);
 
   const ctxPayload = buildChannelInboundEventContext({
     channel: BITRIX24_CHANNEL_ID,
@@ -289,6 +431,8 @@ async function buildTurnPlan(params: {
     ...(normalized.messageId ? { messageId: normalized.messageId } : {}),
     ...(normalized.timestampMs === undefined ? {} : { timestamp: normalized.timestampMs }),
     from: `${BITRIX24_CHANNEL_ID}:${dialogId}`,
+    // The real author: `data.user.id`, falling back to `message.authorId`.
+    // `commands.allowFrom` (owner-only commands) is matched against this id.
     sender: {
       id: normalized.senderStableId,
       ...(normalized.senderName ? { name: normalized.senderName } : {}),
@@ -298,7 +442,7 @@ async function buildTurnPlan(params: {
       kind: peerKind,
       id: dialogId,
       ...(normalized.chatLabel ? { label: normalized.chatLabel } : {}),
-      routePeer: { kind: peerKind, id: peerId },
+      routePeer: route.peer,
     },
     route: {
       agentId: route.agentId,
@@ -309,12 +453,17 @@ async function buildTurnPlan(params: {
     },
     reply: { to: dialogId },
     message: {
-      // InboundEventKind is "user_request" | "room_event"; a DM is a request.
+      // InboundEventKind is "user_request" | "room_event"; a DM or an admitted
+      // (mentioned) group message is a request.
       inboundEventKind: "user_request",
       rawBody: normalized.text,
-      body: normalized.text,
-      bodyForAgent: normalized.text,
+      body: params.agentText,
+      bodyForAgent: params.agentText,
+      // BodyForCommands: core parses `/status` etc. from this, so `@bot /status`
+      // must arrive here as `/status`.
+      commandBody: params.agentText,
     },
+    ...(params.mentions ? { access: { mentions: params.mentions } } : {}),
     // The exact host-resolved ingress result; core re-validates it at dispatch.
     channelIngress: params.ingress as never,
   });
@@ -367,10 +516,20 @@ async function buildTurnPlan(params: {
       ? { dispatchReplyFromConfig: deps.dispatchReplyFromConfig as never }
       : {}),
     delivery: {
+      // Core calls this first, then deliverWithProviderMessageSending with the
+      // result; `null` means "nothing visible" and is recorded by core as
+      // `no_visible_payload`. See delivery.ts for the degrade rules.
+      preparePayload: (payload, info) => prepareBitrix24ReplyPayload(payload, info, warn),
       deliverWithProviderMessageSending: async (payload, info) => {
-        const text = typeof payload.text === "string" ? payload.text : "";
-        if (!text.trim()) {
+        // Re-applied here so the hook is safe on its own: for an already
+        // prepared payload this is the identity on `text`.
+        const rendered = renderBitrix24ReplyText(payload);
+        if (!rendered.visible) {
+          warnReplyDeclined(warn, info.kind, payload, rendered.reason);
           return { visibleReplySent: false };
+        }
+        if (rendered.mediaDropped) {
+          warnReplyMediaDropped(warn, info.kind, payload);
         }
         info.assertPlatformSendAuthorized();
         await info.onPlatformSendDispatch();
@@ -379,10 +538,10 @@ async function buildTurnPlan(params: {
           botId,
           botToken: deps.botToken,
           dialogId,
-          text,
+          text: rendered.text,
           ...(deps.abortSignal ? { signal: deps.abortSignal } : {}),
         });
-        return { messageIds, visibleReplySent: messageIds.length > 0, content: text };
+        return { messageIds, visibleReplySent: messageIds.length > 0, content: rendered.text };
       },
       onError: (error: unknown, info: { kind: string }) => {
         logAt(
@@ -407,7 +566,68 @@ export function describeError(error: unknown): string {
 }
 
 /**
- * Run one Bitrix event through loop guard → SDK ingress → the inbound kernel.
+ * Who added the bot, for the join log line. When the bot created the chat
+ * itself (the bot-side "Chat add" method), Bitrix reports the BOT as `data.user`
+ * (`bot: true`, `externalAuthId: "bot"`, id = the bot id): that is `self`.
+ * Another bot is `bot:<id>`. The sender guard is deliberately NOT applied
+ * here: a join never starts a turn, it is only logged.
+ */
+function describeJoinAdder(params: { deps: Bitrix24InboundDeps; data: Bitrix24RawEvent["data"] }): string {
+  const adderId = asId(params.data?.user?.id);
+  if (!adderId) {
+    return "?";
+  }
+  let selfId = "";
+  try {
+    selfId = asId(params.deps.getBotId());
+  } catch {
+    /* fall back to the event's own bot id */
+  }
+  const eventBotId = asId(params.data?.bot?.id);
+  if (adderId === selfId || adderId === eventBotId) {
+    return "self";
+  }
+  const flaggedBot = params.data?.user?.bot === true || params.data?.user?.isBot === true;
+  return flaggedBot ? `bot:${logToken(adderId)}` : logToken(adderId);
+}
+
+/**
+ * `ONIMBOTV2JOINCHAT`: one info line, no reply, no Bitrix call. States whether
+ * the chat would pass the hard guard and whether it is listed in `groups`, so
+ * an operator can decide from the log alone whether to list it.
+ */
+export function handleBitrix24JoinEvent(params: {
+  deps: Bitrix24InboundDeps;
+  raw: Bitrix24RawEvent;
+}): void {
+  const data = params.raw.data;
+  const dialogId = asId(data?.dialogId) || asId(data?.chat?.dialogId);
+  const chat = { ...(data?.chat ?? {}), ...(dialogId ? { dialogId } : {}) };
+  const kind = resolveBitrix24ChatKind(chat);
+  const verdict = evaluateBitrix24ChatGuard({ kind, dialogId, chat });
+  let listed = "unknown";
+  let groupPolicy = "unknown";
+  try {
+    const account = params.deps.getAccount();
+    groupPolicy = account.groupPolicy;
+    listed = String(Boolean(dialogId && account.groups[dialogId]));
+  } catch {
+    /* a config problem must not turn a log line into a crash */
+  }
+  logAt(
+    params.deps.log,
+    "info",
+    `[bitrix24] bot added to chat dialog=${logToken(dialogId)} ` +
+      `addedBy=${describeJoinAdder({ deps: params.deps, data })} ` +
+      `chatType=${logToken(typeof data?.chat?.type === "string" ? data.chat.type : undefined)} ` +
+      `kind=${kind} guard=${verdict.allowed ? "pass" : `refuse:${verdict.reason}`} ` +
+      `listed=${listed} groupPolicy=${groupPolicy} (no reply sent)`,
+  );
+}
+
+/**
+ * Run one Bitrix event through loop guard → hard guard → group eligibility →
+ * SDK ingress → the inbound kernel.
  *
  * Never throws for a single bad event: the poller must keep draining.
  */
@@ -418,11 +638,16 @@ export async function handleBitrix24InboundEvent(params: {
   const { deps, raw } = params;
   const log = deps.log;
 
-  // 0. Only message-add events can start a turn. Everything else (join chat,
-  //    reaction, delete, …) is acknowledged by the offset and ignored.
+  // 0. Only message-add events can start a turn. The join event is logged at
+  //    info; everything else (reaction, delete, …) is acknowledged by the
+  //    offset and ignored.
   const eventName = bitrix24EventName(raw);
+  if (eventName === BITRIX24_JOIN_EVENT) {
+    handleBitrix24JoinEvent({ deps, raw });
+    return { status: "dropped", reason: "join_chat" };
+  }
   if (eventName !== BITRIX24_MESSAGE_EVENT) {
-    logAt(log, "debug", `[bitrix24] ignoring event ${eventName || "<unnamed>"}`);
+    logAt(log, "debug", `[bitrix24] ignoring event ${eventName ? logToken(eventName) : "<unnamed>"}`);
     return { status: "dropped", reason: "not_a_message" };
   }
 
@@ -438,23 +663,68 @@ export async function handleBitrix24InboundEvent(params: {
     logAt(log, "debug", "[bitrix24] dropped event without a dialogId or user id");
     return { status: "dropped", reason: "unmappable" };
   }
+  const dialogLog = logToken(normalized.conversationId);
+  const senderLog = logToken(normalized.senderStableId);
+  const isGroup = normalized.chatKind === "group";
+
+  // 2. HARD GUARD, fail closed, for DMs and groups. Before config, ingress and
+  //    any reply.
+  const verdict = evaluateBitrix24EventGuard({
+    kind: normalized.chatKind,
+    dialogId: normalized.conversationId,
+    chat: raw.data?.chat,
+    user: raw.data?.user,
+    authorId: raw.data?.message?.authorId,
+  });
+  if (!verdict.allowed) {
+    logAt(
+      log,
+      "info",
+      `[bitrix24] ignored message (hard guard) kind=${normalized.chatKind} ` +
+        `dialog=${dialogLog} sender=${senderLog} reason=${verdict.reason}`,
+    );
+    return { status: "dropped", reason: "guard_refused", detail: verdict.reason };
+  }
 
   const account = deps.getAccount();
   const cfg = deps.getConfig();
 
-  // 2. Groups are out of MVP scope: drop non-direct chats before ingress.
-  if (normalized.chatKind !== "direct" && account.groupPolicy === "disabled") {
-    logAt(
-      log,
-      "debug",
-      `[bitrix24] dropped non-direct chat ${normalized.conversationId} ` +
-        `(type=${normalized.chatType ?? "unknown"}, groupPolicy=disabled)`,
-    );
-    return { status: "dropped", reason: "group_disabled" };
+  // 3. Group eligibility: groupPolicy "allowlist" AND listed in `groups`.
+  let group: ResolvedBitrix24Group | undefined;
+  if (isGroup) {
+    const ignoreGroup = (reason: Bitrix24DropReason): Bitrix24InboundOutcome => {
+      logAt(
+        log,
+        "info",
+        `[bitrix24] ignored group message dialog=${dialogLog} sender=${senderLog} ` +
+          `reason=${reason} groupPolicy=${account.groupPolicy}`,
+      );
+      return { status: "dropped", reason };
+    };
+    if (account.groupPolicy !== "allowlist") {
+      return ignoreGroup("group_disabled");
+    }
+    group = BITRIX24_GROUP_DIALOG_ID_RE.test(normalized.conversationId)
+      ? account.groups[normalized.conversationId]
+      : undefined;
+    if (!group) {
+      return ignoreGroup("group_not_listed");
+    }
+    // Without a numeric bot id the mention can not be detected, and core only
+    // enforces requireMention when canDetectMention is true: refuse instead.
+    if (!/^\d+$/.test(asId(botId))) {
+      return ignoreGroup("bot_id_unknown");
+    }
   }
 
-  // 3. Core-owned ingress: dmPolicy, allowFrom, pairing store, access groups.
-  //    The plugin supplies facts; it does not decide.
+  // 4. Mentions (groups only). DMs keep their text verbatim, as before.
+  const mention: Bitrix24BotMention = group
+    ? detectBitrix24BotMention(normalized.text, botId)
+    : { mentioned: false, text: normalized.text };
+
+  // 5. Core-owned ingress: dmPolicy, allowFrom, pairing store, access groups,
+  //    the group sender allowlist and the mention (activation) gate. The
+  //    plugin supplies facts; it does not decide.
   const dmPolicy: Bitrix24DmPolicy = account.dmPolicy;
   const resolver = createChannelIngressResolver({
     channelId: BITRIX24_CHANNEL_ID,
@@ -467,9 +737,19 @@ export async function handleBitrix24InboundEvent(params: {
     subject: { stableId: normalized.senderStableId },
     conversation: { kind: normalized.chatKind, id: normalized.conversationId },
     dmPolicy,
-    groupPolicy: "disabled",
+    groupPolicy: account.groupPolicy,
     allowFrom: account.allowFrom,
-    groupAllowFrom: [],
+    // In groups the sender allowlist IS channels.bitrix24.allowFrom.
+    groupAllowFrom: isGroup ? account.allowFrom : [],
+    ...(group
+      ? {
+          mentionFacts: { canDetectMention: true, wasMentioned: mention.mentioned },
+          // allowTextCommands:false => no mention bypass, not even for commands.
+          policy: {
+            activation: { requireMention: group.requireMention, allowTextCommands: false },
+          },
+        }
+      : {}),
   });
 
   if (resolved.ingress.decision === "pairing") {
@@ -478,17 +758,60 @@ export async function handleBitrix24InboundEvent(params: {
     });
     return { status: "dropped", reason: "pairing" };
   }
-  if (resolved.ingress.decision !== "allow") {
+  // `admission`, not `decision`: an activation skip (not mentioned) is
+  // decision "allow" with admission "skip".
+  if (resolved.ingress.admission !== "dispatch") {
+    if (isGroup) {
+      const reason: Bitrix24DropReason =
+        resolved.ingress.admission === "skip" ? "not_mentioned" : "blocked";
+      logAt(
+        log,
+        "info",
+        `[bitrix24] ignored group message dialog=${dialogLog} sender=${senderLog} ` +
+          `reason=${reason} ingress=${resolved.ingress.reasonCode}`,
+      );
+      return { status: "dropped", reason, detail: resolved.ingress.reasonCode };
+    }
     logAt(
       log,
       "warn",
-      `[bitrix24] Blocked unauthorized bitrix24 sender ${normalized.senderStableId} ` +
+      `[bitrix24] Blocked unauthorized bitrix24 sender ${senderLog} ` +
         `(dmPolicy=${dmPolicy}, reason=${resolved.ingress.reasonCode})`,
     );
     return { status: "dropped", reason: "blocked" };
   }
 
-  // 4. Core owns ingest → classify → preflight → resolve → record → dispatch.
+  // 6. Session: a group must get its own per-group session, never a DM's or
+  //    the main one.
+  const route = resolveBitrix24Route({
+    cfg,
+    accountId: deps.accountId,
+    chatKind: normalized.chatKind,
+    conversationId: normalized.conversationId,
+    senderStableId: normalized.senderStableId,
+  });
+  if (isGroup && !isIsolatedBitrix24GroupSession(route, normalized.conversationId)) {
+    logAt(
+      log,
+      "warn",
+      `[bitrix24] refused group message dialog=${dialogLog}: its session is not a per-group ` +
+        `session (check session.groupScope and binding session overrides)`,
+    );
+    return { status: "dropped", reason: "group_session_not_isolated" };
+  }
+
+  const mentions: Bitrix24MentionAccess | undefined = group
+    ? {
+        canDetectMention: true,
+        wasMentioned: mention.mentioned,
+        requireMention: group.requireMention,
+        ...(resolved.activationAccess.effectiveWasMentioned === undefined
+          ? {}
+          : { effectiveWasMentioned: resolved.activationAccess.effectiveWasMentioned }),
+      }
+    : undefined;
+
+  // 7. Core owns ingest → classify → preflight → resolve → record → dispatch.
   const result = await runChannelInboundEvent<NormalizedBitrix24Event>({
     channel: BITRIX24_CHANNEL_ID,
     accountId: deps.accountId,
@@ -498,12 +821,20 @@ export async function handleBitrix24InboundEvent(params: {
         id: input.id,
         ...(input.timestampMs === undefined ? {} : { timestamp: input.timestampMs }),
         rawText: input.text,
-        textForAgent: input.text,
-        textForCommands: input.text,
+        textForAgent: mention.text,
+        textForCommands: mention.text,
         raw: input,
       }),
       resolveTurn: async () =>
-        await buildTurnPlan({ deps, cfg, normalized, ingress: resolved }),
+        await buildTurnPlan({
+          deps,
+          cfg,
+          normalized,
+          route,
+          agentText: mention.text,
+          mentions,
+          ingress: resolved,
+        }),
     },
   } as Parameters<typeof runChannelInboundEvent<NormalizedBitrix24Event>>[0]);
 
@@ -516,8 +847,8 @@ export async function handleBitrix24InboundEvent(params: {
   logAt(
     log,
     "info",
-    `[bitrix24] inbound turn admitted sender=${normalized.senderStableId} ` +
-      `dialog=${normalized.conversationId} agent=${agentId || "?"} ` +
+    `[bitrix24] inbound turn admitted kind=${normalized.chatKind} sender=${senderLog} ` +
+      `dialog=${dialogLog} agent=${agentId || "?"} ` +
       `session=${sessionKey || "?"} dispatched=${dispatched}`,
   );
   return { status: "dispatched", dispatched, agentId, sessionKey };

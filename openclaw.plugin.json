@@ -127,10 +127,30 @@
           "groupPolicy": {
             "type": "string",
             "enum": [
-              "disabled"
+              "disabled",
+              "allowlist"
             ],
             "default": "disabled",
-            "description": "Group chats are out of MVP scope."
+            "description": "Default 'disabled'. 'allowlist' admits ONLY chats listed in `groups`, and only senders in `allowFrom`. There is deliberately no 'open' value."
+          },
+          "groups": {
+            "type": "object",
+            "default": {},
+            "description": "Eligible group chats, keyed by Bitrix dialog id (chat<N>). Unlisted chats are ignored.",
+            "patternProperties": {
+              "^chat\\d+$": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "requireMention": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Reply only when the bot is @mentioned. Default true."
+                  }
+                }
+              }
+            },
+            "additionalProperties": false
           },
           "bot": {
             "type": "object",

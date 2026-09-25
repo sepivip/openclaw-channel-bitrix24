@@ -38,8 +38,12 @@
       // Empty means nobody is allowed — that is the intended default.
       allowFrom: [],
 
-      // MVP is DMs only.
+      // Group chats are OFF. "allowlist" (the only other value; there is no
+      // "open") admits ONLY the chats listed in `groups`, only when the bot is
+      // @mentioned, and only from senders in allowFrom. ONIMBOTV2JOINCHAT is
+      // logged at info (dialog id, who added the bot, guard verdict, listed?).
       groupPolicy: "disabled",
+      // groups: { "chat<N>": { requireMention: true } },
 
       bot: {
         code: "openclaw_bot",

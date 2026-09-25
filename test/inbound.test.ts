@@ -18,7 +18,7 @@ function event(overrides: Partial<NonNullable<Bitrix24RawEvent["data"]>> = {}): 
     data: {
       message: { id: 900, authorId: 77, text: "ping" },
       chat: { dialogId: "42", type: "private" },
-      user: { id: 77, name: "Beka", bot: false },
+      user: { id: 77, name: "Test User", bot: false },
       ...overrides,
     },
   };
@@ -57,11 +57,14 @@ describe("event envelope", () => {
   });
 
   it("ignores every non-message event before touching config", async () => {
-    const outcome = await handleBitrix24InboundEvent({
-      deps: explodingDeps("777"),
-      raw: { eventId: 5, type: "ONIMBOTV2JOINCHAT", data: {} },
-    });
-    expect(outcome).toEqual({ status: "dropped", reason: "not_a_message" });
+    // ONIMBOTV2JOINCHAT is no longer "ignored": it is logged (see groups.test.ts).
+    for (const type of ["ONIMBOTV2REACTIONCHANGE", "ONIMBOTV2MESSAGEDELETE", "ONIMBOTV2CONTEXTGET"]) {
+      const outcome = await handleBitrix24InboundEvent({
+        deps: explodingDeps("777"),
+        raw: { eventId: 5, type, data: {} },
+      });
+      expect(outcome).toEqual({ status: "dropped", reason: "not_a_message" });
+    }
   });
 });
 
@@ -143,7 +146,7 @@ describe("normalizeBitrix24Event", () => {
       text: "ping",
       conversationId: "42",
       senderStableId: "77",
-      senderName: "Beka",
+      senderName: "Test User",
       senderIsBot: false,
       authorId: "77",
       chatType: "private",

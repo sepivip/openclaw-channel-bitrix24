@@ -5,6 +5,7 @@
 //   result   { events: [...], nextOffset, hasMore }
 //   "offset — Confirms all events with IDs less than the specified value.
 //    Not passed on the first call."
+//   After `hasMore: true`, wait at least 2 s before the next Event.get.
 // So `nextOffset` is the ack: persisting it before the next call is what makes
 // a restart neither replay nor skip (design §2.2 "Idempotency").
 //
@@ -62,6 +63,13 @@ export type Bitrix24Poller = {
 };
 
 export const BITRIX24_EVENT_LIMIT = 100;
+
+/**
+ * imbot.v2 `Event.get`: after a response with `hasMore: true`, Bitrix requires
+ * a pause of at least 2 seconds before the next `Event.get`. Not configurable,
+ * so it can not be set below the documented minimum.
+ */
+export const BITRIX24_HAS_MORE_PAUSE_MS = 2_000;
 
 function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -162,7 +170,8 @@ export function createBitrix24Poller(options: Bitrix24PollerOptions): Bitrix24Po
     while (!signal.aborted) {
       let sawEvents = false;
       try {
-        // Drain: keep going without sleeping while Bitrix reports `hasMore`.
+        // Drain while Bitrix reports `hasMore`, pausing BITRIX24_HAS_MORE_PAUSE_MS
+        // (abortable) between pages as the Event.get contract requires.
         for (;;) {
           const batch = await fetchOnce(signal);
           if (batch.events.length > 0) {
@@ -176,6 +185,10 @@ export function createBitrix24Poller(options: Bitrix24PollerOptions): Bitrix24Po
             await options.stateStore.set(offsetKey, offset);
           }
           if (!batch.hasMore || signal.aborted) {
+            break;
+          }
+          await sleep(BITRIX24_HAS_MORE_PAUSE_MS, signal);
+          if (signal.aborted) {
             break;
           }
         }

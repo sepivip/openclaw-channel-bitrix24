@@ -30,7 +30,9 @@ This is a **community plugin** implementing Path B after Path A was rejected for
 
 * **Default deny, enforced by core**: Per-event admission is decided by OpenClaw SDK ingress. `dmPolicy` defaults to `allowlist`; there is no `"open"` value. `allowFrom` accepts numeric Bitrix user ids only.
 
-* **Groups dropped before ingress**: `groupPolicy` is `disabled`; any non-direct chat is dropped and logged at debug.
+* **Groups off by default, allowlisted when on**: `groupPolicy` is `"disabled"` (default) or `"allowlist"`; there is no `"open"`. Under `allowlist` only chats listed in `groups` (keys `chat<N>`) are eligible, and a turn starts only when the bot is @mentioned AND the sender is in `allowFrom`. See [Group chats](#group-chats).
+
+* **Hard guard before policy**: Extranet chats, chats with collabers, Open Lines / entity-linked chats, non-`chat` group types, and extranet / connector / bot / external-auth senders are refused before config, ingress or any reply (`src/guard.ts`). Fail closed: a missing safety field on a group counts as unsafe.
 
 * **Loop guard**: `data.message.authorId === botId || data.user.bot === true` ⇒ dropped before ingress.
 
@@ -45,7 +47,7 @@ This is a **community plugin** implementing Path B after Path A was rejected for
 ```bash
 npm ci
 npm run build     # tsc -> dist/*.js
-npm test          # optional: 91 tests, no network egress
+npm test          # optional: 274 tests, no network egress
 ```
 
 ### 2. Deploy to Docker volume
@@ -155,7 +157,8 @@ docker compose restart openclaw-gateway
 | `portalDomain` | string | Portal domain for URL validation, e.g. `example.bitrix24.eu`. |
 | `dmPolicy` | enum | `"allowlist"` \| `"pairing"` \| `"disabled"`. Default `"allowlist"`. No `"open"` value. |
 | `allowFrom` | array | Numeric Bitrix24 user IDs. Empty = nobody allowed. |
-| `groupPolicy` | enum | `"disabled"` only. Group chats out of MVP scope. |
+| `groupPolicy` | enum | `"disabled"` \| `"allowlist"`. Default `"disabled"`. No `"open"` value. See [Group chats](#group-chats). |
+| `groups` | object | Eligible group chats keyed by dialog id `chat<N>`: `{ "chat<N>": { requireMention?: boolean } }`, `requireMention` default `true`. Unlisted chats are ignored. |
 | `bot.code` | string | Bot identifier. Default `"openclaw_bot"`. |
 | `bot.name` | string | Display name. Default `"Assistant"`. |
 | `bot.color` | string | Bot color. Default `"PURPLE"`. |
@@ -163,17 +166,97 @@ docker compose restart openclaw-gateway
 | `poll.idleMs` | integer | Poll interval when idle (≥1000ms). Default `15000`. |
 | `poll.activeMs` | integer | Poll interval when active (≥500ms). Default `3000`. |
 
+## Group chats
+
+Off by default. Enabling needs both keys, and only listed chats are eligible:
+
+```json5
+channels: {
+  bitrix24: {
+    groupPolicy: "allowlist",                 // default "disabled"; there is no "open"
+    groups: { "chat<N>": { requireMention: true } },  // requireMention defaults to true
+    // group senders are matched against allowFrom; there is no separate groupAllowFrom
+  },
+},
+```
+
+Per `ONIMBOTV2MESSAGEADD`, in this order (`src/inbound.ts`):
+
+1. **Loop guard.** The bot's own messages and bot senders are dropped.
+2. **Hard guard** (`src/guard.ts`), every event, DM or group. Refused (no
+   reply, info log `reason=<rule>`): `chat.entityType` non-empty (Open Lines
+   and any entity-linked chat); `chat.extranet === true`;
+   `chat.containsCollaber === true`; sender `extranet`, `connector` or `bot`;
+   sender `externalAuthId` one of the documented external types `email`,
+   `replica`, `bot`, `imconnector`. This is a denylist: employees carry
+   `default`, `socservices` (social/SSO sign-in) or other values, and those
+   pass this rule; they still have to be on `allowFrom`. Groups additionally
+   need `chat.extranet === false` and `chat.containsCollaber === false` (a
+   missing field is unsafe), `chat.type === "chat"`, `chat.messageType` absent
+   or `"C"`, and `user.id` equal to `message.authorId`. A DM needs a numeric
+   dialog id. A normal employee's DM behaves as before.
+3. **Eligibility.** A group is ignored (info log) unless `groupPolicy` is
+   `allowlist` and its dialog id is a key of `groups`.
+4. **Mention** (`src/mentions.ts`): the bot's `[USER=<botId>]…[/USER]`, with
+   `<botId>` = `data.bot.id`, is detected and stripped. The format is not
+   documented but was confirmed on a real v2 group event: `message.params` is
+   empty and there is no structured mentions field. The stripped text is what
+   the agent sees and what commands are parsed from. Bitrix itself sends no
+   event for an unmentioned group message to a `bot`-type bot, so core's
+   `requireMention` gate is a second layer.
+5. **Core ingress** decides: `groupPolicy`, `groupAllowFrom = allowFrom`, and
+   the activation gate (`mentionFacts` + `requireMention`,
+   `allowTextCommands: false`, so not even a command bypasses the mention).
+6. **Session.** A group runs in its own session
+   (`agent:<agent>:bitrix24:group:chat<N>`, core's default
+   `session.groupScope: "per-group"`). If config folds groups into the main
+   session, the message is refused with a warning.
+
+Commands stay owner-only through core's `commands.allowFrom`, which matches
+the sender id; the plugin hands core the real author (`data.user.id`,
+falling back to `message.authorId`) and the mention-stripped command text.
+Replies in a group are visible to every member of that chat.
+
+`ONIMBOTV2JOINCHAT` (bot added to a chat) is logged once at info with the
+dialog id, who added the bot, the chat type, the hard-guard verdict and
+whether the chat is listed. The bot never replies to it. When the bot created
+the chat itself, Bitrix reports the bot as the user who added it; that is
+logged as `addedBy=self` (another bot: `addedBy=bot:<id>`).
+
+The poller waits 2 s after an `Event.get` page with `hasMore: true` before
+fetching the next one, as the imbot.v2 contract requires.
+
+## Reply delivery
+
+Core hands this channel the raw reply payload (`preparePayload`, then
+`deliverWithProviderMessageSending`) and renders no cards on this route.
+`src/delivery.ts` degrades everything to plain text with the SDK's own
+renderers (`openclaw/plugin-sdk/interactive-runtime`): a presentation with
+`presentationTextMode: "fallback"` sends its text (for example `/status`); any
+other presentation, and legacy `interactive` buttons, are rendered as text
+lines (command buttons show the command; callback values are never shown).
+`channelData` is opaque transport data: with text the text is sent, alone it
+is declined. Media is never sent. A payload with nothing visible is declined
+with a warning naming the reply kind and the payload's key names; no content
+is logged, and no empty message is ever sent.
+
 ## Testing
 
 Run tests locally:
 
 ```bash
-npm test          # vitest: 91 tests
+npm test          # vitest: 274 tests
 npm run typecheck # tsc --noEmit
 ```
 
 Tests include:
 - Unit tests for config, client, secrets, inbound/outbound handlers
+- Hard guard, mention detection, reply degradation and poller pacing
+  (`test/guard.test.ts`, `test/mentions.test.ts`, `test/delivery.test.ts`,
+  `test/poller.test.ts`)
+- Group chats, sessions and command hand-off through the real SDK ingress and
+  router (`test/groups.test.ts`), with synthetic fixtures that match real v2
+  DM, group and join events (`test/fixtures.ts`)
 - Integration test with a fake Bitrix24 server (`test/fake-bitrix/server.mjs`)
 - No network egress; all tests run offline
 
@@ -193,7 +276,8 @@ After deployment:
 - [ ] Account starts when `enabled: true`: check logs for bot registration
 - [ ] DM from allowed user arrives and generates response
 - [ ] DM from non-allowed user is blocked (logged at debug)
-- [ ] Group chat message is dropped (logged at debug)
+- [ ] Group chat message is ignored (info log with a reason) unless `groupPolicy` is `allowlist`, the chat is listed in `groups`, the bot is @mentioned and the sender is in `allowFrom`
+- [ ] `/status` and other card/button replies arrive as plain text
 - [ ] Bot does not echo its own messages
 - [ ] Markdown formatting works (BBCode conversion)
 - [ ] Long messages are chunked correctly (4000-char limit)
@@ -215,6 +299,11 @@ After deployment:
 - Verify `allowFrom` includes the sender's Bitrix24 user ID
 - Check poll interval: maybe increase `poll.idleMs`/`poll.activeMs` temporarily
 - Look for rate limit errors in logs
+
+**Bot silent in a group chat**
+- Check `groupPolicy` is `"allowlist"` and the chat's dialog id (`chat<N>`) is a key of `groups`
+- The message must @mention the bot, and the sender must be in `allowFrom`
+- Look for `ignored group message ... reason=` or `(hard guard) ... reason=` info lines in the logs
 
 **Messages not sending**
 - Check Bitrix24 API response in logs
