@@ -18,7 +18,7 @@ function event(overrides: Partial<NonNullable<Bitrix24RawEvent["data"]>> = {}): 
     data: {
       message: { id: 900, authorId: 77, text: "ping" },
       chat: { dialogId: "42", type: "private" },
-      user: { id: 77, name: "Beka", bot: false },
+      user: { id: 77, name: "Test User", bot: false },
       ...overrides,
     },
   };
@@ -143,7 +143,7 @@ describe("normalizeBitrix24Event", () => {
       text: "ping",
       conversationId: "42",
       senderStableId: "77",
-      senderName: "Beka",
+      senderName: "Test User",
       senderIsBot: false,
       authorId: "77",
       chatType: "private",
