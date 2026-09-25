@@ -23,6 +23,17 @@ export const BITRIX24_DM_POLICIES = ["allowlist", "pairing", "disabled"] as cons
 export type Bitrix24DmPolicy = (typeof BITRIX24_DM_POLICIES)[number];
 export const BITRIX24_DEFAULT_DM_POLICY: Bitrix24DmPolicy = "allowlist";
 
+/**
+ * Group chats. Deliberately no `"open"` value: a group is only ever eligible
+ * when it is listed in `groups` AND `groupPolicy` is `"allowlist"`.
+ */
+export const BITRIX24_GROUP_POLICIES = ["disabled", "allowlist"] as const;
+export type Bitrix24GroupPolicy = (typeof BITRIX24_GROUP_POLICIES)[number];
+export const BITRIX24_DEFAULT_GROUP_POLICY: Bitrix24GroupPolicy = "disabled";
+
+/** A Bitrix group dialog id: `chat{chatId}` (`Chat.Message.send` docs). */
+export const BITRIX24_GROUP_DIALOG_ID_RE = /^chat\d+$/;
+
 /** Bitrix user ids are numeric strings. Telegram's `isNumericTelegramSenderUserId` pattern. */
 const NUMERIC_ID_RE = /^\d+$/;
 
@@ -101,9 +112,30 @@ export const bitrix24ChannelJsonSchema = {
     },
     groupPolicy: {
       type: "string",
-      enum: ["disabled"],
-      default: "disabled",
-      description: "Group chats are out of MVP scope.",
+      enum: [...BITRIX24_GROUP_POLICIES],
+      default: BITRIX24_DEFAULT_GROUP_POLICY,
+      description:
+        "Default 'disabled'. 'allowlist' admits ONLY chats listed in `groups`, and only senders in `allowFrom`. There is deliberately no 'open' value.",
+    },
+    groups: {
+      type: "object",
+      default: {},
+      description:
+        "Eligible group chats, keyed by Bitrix dialog id (chat<N>). Unlisted chats are ignored.",
+      patternProperties: {
+        "^chat\\d+$": {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            requireMention: {
+              type: "boolean",
+              default: true,
+              description: "Reply only when the bot is @mentioned. Default true.",
+            },
+          },
+        },
+      },
+      additionalProperties: false,
     },
     bot: {
       type: "object",
@@ -164,10 +196,21 @@ export type Bitrix24ChannelConfig = {
   portalDomain?: string;
   dmPolicy?: Bitrix24DmPolicy;
   allowFrom?: unknown;
-  groupPolicy?: "disabled";
+  groupPolicy?: Bitrix24GroupPolicy;
+  groups?: Record<string, Bitrix24GroupConfig>;
   bot?: Partial<Bitrix24BotIdentity>;
   poll?: { idleMs?: number; activeMs?: number };
   allowInsecureHttpForTests?: boolean;
+};
+
+/** Per-group settings as authored under `channels.bitrix24.groups.<dialogId>`. */
+export type Bitrix24GroupConfig = {
+  requireMention?: boolean;
+};
+
+/** Per-group settings after normalization. `requireMention` is never undefined. */
+export type ResolvedBitrix24Group = {
+  requireMention: boolean;
 };
 
 export type Bitrix24SecretStatus = "available" | "configured_unavailable" | "missing";
@@ -188,7 +231,13 @@ export type ResolvedBitrix24Account = {
   portalDomains: string[];
   dmPolicy: Bitrix24DmPolicy;
   allowFrom: string[];
-  groupPolicy: "disabled";
+  groupPolicy: Bitrix24GroupPolicy;
+  /**
+   * Eligible group chats keyed by dialog id (`chat<N>`). Only keys matching
+   * `BITRIX24_GROUP_DIALOG_ID_RE` survive normalization. Null-prototype object,
+   * so a lookup can never hit an inherited key.
+   */
+  groups: Readonly<Record<string, ResolvedBitrix24Group>>;
   bot: Bitrix24BotIdentity;
   poll: { idleMs: number; activeMs: number };
   /** Test-only http escape hatch request; still gated on NODE_ENV/env marker. */
@@ -242,6 +291,57 @@ function normalizeDmPolicy(raw: unknown, warn?: (message: string) => void): Bitr
     `[bitrix24] unsupported dmPolicy "${raw}"; falling back to "${BITRIX24_DEFAULT_DM_POLICY}".`,
   );
   return BITRIX24_DEFAULT_DM_POLICY;
+}
+
+/** Anything but an explicit `"allowlist"` resolves to `"disabled"` (fail closed). */
+export function normalizeBitrix24GroupPolicy(
+  raw: unknown,
+  warn?: (message: string) => void,
+): Bitrix24GroupPolicy {
+  if (raw === undefined || raw === null || raw === "") {
+    return BITRIX24_DEFAULT_GROUP_POLICY;
+  }
+  if (typeof raw === "string" && (BITRIX24_GROUP_POLICIES as readonly string[]).includes(raw)) {
+    return raw as Bitrix24GroupPolicy;
+  }
+  warn?.(
+    `[bitrix24] unsupported groupPolicy; falling back to "${BITRIX24_DEFAULT_GROUP_POLICY}" (allowed: ${BITRIX24_GROUP_POLICIES.join(", ")}).`,
+  );
+  return BITRIX24_DEFAULT_GROUP_POLICY;
+}
+
+/**
+ * Keep only `chat<N>` keys whose value is an object. `requireMention` is true
+ * unless it is literally `false`, so a typo can only make the gate stricter.
+ */
+export function normalizeBitrix24Groups(
+  raw: unknown,
+  warn?: (message: string) => void,
+): Readonly<Record<string, ResolvedBitrix24Group>> {
+  const out: Record<string, ResolvedBitrix24Group> = Object.create(null) as Record<
+    string,
+    ResolvedBitrix24Group
+  >;
+  if (raw === undefined || raw === null) {
+    return out;
+  }
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    warn?.("[bitrix24] channels.bitrix24.groups must be an object keyed by chat<N>; ignoring it.");
+    return out;
+  }
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!BITRIX24_GROUP_DIALOG_ID_RE.test(key)) {
+      warn?.("[bitrix24] dropping groups entry whose key is not a Bitrix group dialog id (chat<N>).");
+      continue;
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      warn?.(`[bitrix24] dropping groups.${key}: the entry must be an object.`);
+      continue;
+    }
+    const requireMention = (value as Bitrix24GroupConfig).requireMention !== false;
+    out[key] = { requireMention };
+  }
+  return out;
 }
 
 function inspectSecret(value: unknown, path: string): Bitrix24SecretStatus {
@@ -325,7 +425,8 @@ export function resolveBitrix24Account(
     portalDomains: portalDomain ? [portalDomain] : [],
     dmPolicy: normalizeDmPolicy(section.dmPolicy, warn),
     allowFrom: normalizeBitrix24AllowFrom(section.allowFrom, warn),
-    groupPolicy: "disabled",
+    groupPolicy: normalizeBitrix24GroupPolicy(section.groupPolicy, warn),
+    groups: normalizeBitrix24Groups(section.groups, warn),
     bot: {
       code: section.bot?.code ?? BITRIX24_DEFAULT_BOT.code,
       name: section.bot?.name ?? BITRIX24_DEFAULT_BOT.name,
@@ -356,6 +457,8 @@ export function inspectBitrix24Account(
   portalDomainConfigured: boolean;
   dmPolicy: Bitrix24DmPolicy;
   allowFromCount: number;
+  groupPolicy: Bitrix24GroupPolicy;
+  groupCount: number;
   stateReason?: string;
 } {
   const section = readSection(cfg);
@@ -377,6 +480,8 @@ export function inspectBitrix24Account(
     portalDomainConfigured,
     dmPolicy: normalizeDmPolicy(section.dmPolicy),
     allowFromCount: normalizeBitrix24AllowFrom(section.allowFrom).length,
+    groupPolicy: normalizeBitrix24GroupPolicy(section.groupPolicy),
+    groupCount: Object.keys(normalizeBitrix24Groups(section.groups)).length,
     ...(enabled ? {} : { stateReason: "channels.bitrix24.enabled is not true" }),
   };
 }

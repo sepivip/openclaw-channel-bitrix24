@@ -57,11 +57,14 @@ describe("event envelope", () => {
   });
 
   it("ignores every non-message event before touching config", async () => {
-    const outcome = await handleBitrix24InboundEvent({
-      deps: explodingDeps("777"),
-      raw: { eventId: 5, type: "ONIMBOTV2JOINCHAT", data: {} },
-    });
-    expect(outcome).toEqual({ status: "dropped", reason: "not_a_message" });
+    // ONIMBOTV2JOINCHAT is no longer "ignored": it is logged (see groups.test.ts).
+    for (const type of ["ONIMBOTV2REACTIONCHANGE", "ONIMBOTV2MESSAGEDELETE", "ONIMBOTV2CONTEXTGET"]) {
+      const outcome = await handleBitrix24InboundEvent({
+        deps: explodingDeps("777"),
+        raw: { eventId: 5, type, data: {} },
+      });
+      expect(outcome).toEqual({ status: "dropped", reason: "not_a_message" });
+    }
   });
 });
 

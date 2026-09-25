@@ -1,9 +1,14 @@
+import { readFileSync } from "node:fs";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   BITRIX24_DEFAULT_DM_POLICY,
+  bitrix24ChannelConfigSchema,
+  bitrix24ChannelJsonSchema,
   inspectBitrix24Account,
   listBitrix24AccountIds,
   normalizeBitrix24AllowFrom,
+  normalizeBitrix24GroupPolicy,
+  normalizeBitrix24Groups,
   resetBitrix24ConfigNotices,
   resolveBitrix24Account,
 } from "../src/config-schema.js";
@@ -48,6 +53,7 @@ describe("fail-closed config resolution", () => {
     expect(account.dmPolicy).toBe(BITRIX24_DEFAULT_DM_POLICY);
     expect(account.allowFrom).toEqual([]);
     expect(account.groupPolicy).toBe("disabled");
+    expect(account.groups).toEqual({});
   });
 
   it("defaults enabled to false when the key is absent or non-boolean", () => {
@@ -98,6 +104,129 @@ describe("dmPolicy", () => {
     expect(resolveBitrix24Account(cfg({ dmPolicy: "open" })).dmPolicy).toBe("allowlist");
     expect(resolveBitrix24Account(cfg({ dmPolicy: "pairing" })).dmPolicy).toBe("pairing");
     expect(resolveBitrix24Account(cfg({ dmPolicy: "disabled" })).dmPolicy).toBe("disabled");
+  });
+});
+
+describe("groupPolicy and groups", () => {
+  it("defaults to disabled with no groups", () => {
+    const account = resolveBitrix24Account(cfg({}));
+    expect(account.groupPolicy).toBe("disabled");
+    expect(Object.keys(account.groups)).toEqual([]);
+  });
+
+  it("accepts only 'disabled' and 'allowlist'; anything else (including 'open') is disabled", () => {
+    expect(resolveBitrix24Account(cfg({ groupPolicy: "allowlist" })).groupPolicy).toBe("allowlist");
+    expect(resolveBitrix24Account(cfg({ groupPolicy: "disabled" })).groupPolicy).toBe("disabled");
+    for (const raw of ["open", "ALLOWLIST", "all", 1, true, {}]) {
+      const warnings: string[] = [];
+      expect(normalizeBitrix24GroupPolicy(raw, (m) => warnings.push(m))).toBe("disabled");
+      expect(warnings).toHaveLength(1);
+    }
+  });
+
+  it("keeps only chat<N> keys whose value is an object; requireMention defaults to true", () => {
+    const warnings: string[] = [];
+    const groups = normalizeBitrix24Groups(
+      {
+        chat8801: {},
+        chat8802: { requireMention: false },
+        chat8803: { requireMention: "no" },
+        chat8804: { requireMention: true },
+        "8805": {},
+        chat: {},
+        "chat8806 ": {},
+        CHAT8807: {},
+        chat8808: true,
+        chat8809: null,
+      },
+      (m) => warnings.push(m),
+    );
+    expect({ ...groups }).toEqual({
+      chat8801: { requireMention: true },
+      chat8802: { requireMention: false },
+      chat8803: { requireMention: true },
+      chat8804: { requireMention: true },
+    });
+    expect(warnings.length).toBe(6);
+  });
+
+  it("never resolves an inherited key as a listed group", () => {
+    const groups = normalizeBitrix24Groups({ chat8801: {} });
+    expect(groups["toString" as string]).toBeUndefined();
+    expect(groups["__proto__" as string]).toBeUndefined();
+    expect(groups["constructor" as string]).toBeUndefined();
+  });
+
+  it("treats a non-object groups value as empty", () => {
+    expect(Object.keys(normalizeBitrix24Groups(["chat8801"]))).toEqual([]);
+    expect(Object.keys(normalizeBitrix24Groups("chat8801"))).toEqual([]);
+  });
+
+  it("keeps enabled:false inert and default-deny with groups configured", () => {
+    const account = resolveBitrix24Account(
+      cfg({ groupPolicy: "allowlist", groups: { chat8801: {} } }),
+    );
+    expect(account.enabled).toBe(false);
+    expect(account.allowFrom).toEqual([]);
+  });
+
+  it("reports groupPolicy and the group count in inspectAccount", () => {
+    const inspected = inspectBitrix24Account(
+      cfg({ groupPolicy: "allowlist", groups: { chat8801: {}, bogus: {} } }),
+    );
+    expect(inspected.groupPolicy).toBe("allowlist");
+    expect(inspected.groupCount).toBe(1);
+  });
+});
+
+describe("JSON schema (the SDK's runtime validator)", () => {
+  const safeParse = (value: unknown) =>
+    bitrix24ChannelConfigSchema.runtime!.safeParse(value) as {
+      success: boolean;
+      data?: Record<string, unknown>;
+    };
+
+  it("accepts groupPolicy allowlist with a chat<N> group and fills requireMention", () => {
+    const result = safeParse({ groupPolicy: "allowlist", groups: { chat8801: {} } });
+    expect(result.success).toBe(true);
+    expect(result.data?.groups).toEqual({ chat8801: { requireMention: true } });
+  });
+
+  it("defaults groupPolicy to disabled", () => {
+    const result = safeParse({});
+    expect(result.success).toBe(true);
+    expect(result.data?.groupPolicy).toBe("disabled");
+  });
+
+  it.each([
+    ["groupPolicy open", { groupPolicy: "open" }],
+    ["a non-chat<N> group key", { groups: { "8801": {} } }],
+    ["an unknown per-group key", { groups: { chat8801: { allowFrom: ["4101"] } } }],
+    ["a non-boolean requireMention", { groups: { chat8801: { requireMention: "yes" } } }],
+  ])("rejects %s", (_label, value) => {
+    expect(safeParse(value).success).toBe(false);
+  });
+
+  it("the manifest schema mirrors the code schema (descriptions aside)", () => {
+    const manifest = JSON.parse(
+      readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+    ) as { channelConfigs: { bitrix24: { schema: unknown } } };
+    const stripDescriptions = (value: unknown): unknown => {
+      if (Array.isArray(value)) {
+        return value.map(stripDescriptions);
+      }
+      if (value && typeof value === "object") {
+        return Object.fromEntries(
+          Object.entries(value)
+            .filter(([key]) => key !== "description")
+            .map(([key, inner]) => [key, stripDescriptions(inner)]),
+        );
+      }
+      return value;
+    };
+    expect(stripDescriptions(manifest.channelConfigs.bitrix24.schema)).toEqual(
+      stripDescriptions(JSON.parse(JSON.stringify(bitrix24ChannelJsonSchema))),
+    );
   });
 });
 
