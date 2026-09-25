@@ -97,6 +97,12 @@ describe("loop guard", () => {
     expect(isOwnBitrix24Event(event({ user: { id: 99, isBot: true } }), 77)).toBe(true);
   });
 
+  it("drops a message whose user.id is the bot, even without authorId", () => {
+    const raw = event({ message: { id: 902, text: "file" }, user: { id: 77, bot: false } });
+    expect(isOwnBitrix24Event(raw, 77)).toBe(true);
+    expect(isOwnBitrix24Event(raw, "77")).toBe(true);
+  });
+
   it("passes a human message from another user", () => {
     const raw = event({ message: { id: 901, authorId: 99, text: "hi" }, user: { id: 99 } });
     expect(isOwnBitrix24Event(raw, 77)).toBe(false);

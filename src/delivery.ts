@@ -22,9 +22,11 @@
 //   5. nothing visible yet -> `fallbackText.text` when the runtime supplied one.
 //   6. still nothing -> the payload is DECLINED (never an empty message) with
 //      a warning naming the reply kind and the payload's top-level keys.
-// Media (`mediaUrl`/`mediaUrls`) is never sent: this bridge has no upload
-// method on its allowlist. Text next to media is sent with a warning; a
-// media-only payload is declined with a warning.
+// Media (`mediaUrl`/`mediaUrls`) in a reply is never sent: replies are text
+// only. The one file path in this plugin is the `bitrix24_send_sheet` agent
+// tool (src/tools.ts), which uploads a server-built .xlsx itself. Text next
+// to media is sent with a warning; a media-only payload is declined with a
+// warning.
 //
 // Nothing here logs message content or any credential.
 

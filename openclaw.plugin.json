@@ -11,6 +11,17 @@
   "activation": {
     "onStartup": true
   },
+  "contracts": {
+    "tools": [
+      "bitrix24_send_sheet"
+    ]
+  },
+  "toolMetadata": {
+    "bitrix24_send_sheet": {
+      "optional": true,
+      "sideEffecting": true
+    }
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

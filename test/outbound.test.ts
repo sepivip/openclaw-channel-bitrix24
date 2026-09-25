@@ -1,10 +1,164 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { createBitrix24Client, type Bitrix24Client } from "../src/client.js";
 import {
   BITRIX24_CHUNK_LIMIT,
+  BITRIX24_FILE_UPLOAD_TIMEOUT_MS,
   chunkText,
   escapeBbCode,
+  extractFileUploadResult,
   markdownToBbCode,
+  sendFile,
 } from "../src/outbound.js";
+import { Bitrix24Error } from "../src/secrets.js";
+
+type RecordedCall = { method: string; params: Record<string, unknown>; options: unknown };
+
+function recordingClient(result: unknown = { file: { id: 138 }, messageId: 123, chatId: 5, dialogId: "chat5" }) {
+  const calls: RecordedCall[] = [];
+  const client: Bitrix24Client = {
+    call: (async (method: string, params?: Record<string, unknown>, options?: unknown) => {
+      calls.push({ method, params: params ?? {}, options });
+      return result;
+    }) as Bitrix24Client["call"],
+    describe: () => ({ host: "synthetic.bitrix24.test", userId: "7" }),
+  };
+  return { client, calls };
+}
+
+describe("sendFile (imbot.v2.File.upload)", () => {
+  it("sends the documented request shape with a 60 s timeout and no transport retry", async () => {
+    const { client, calls } = recordingClient();
+    const result = await sendFile({
+      client,
+      botId: "9001",
+      botToken: "fake-bot-token",
+      dialogId: "chat8801",
+      fileName: "stock-all-2026-01-15.xlsx",
+      contentBase64: "UEsDBA==",
+      caption: "Stock across all warehouses",
+    });
+    expect(result).toEqual({ fileId: "138", messageId: "123" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.method).toBe("imbot.v2.File.upload");
+    expect(calls[0]?.params).toEqual({
+      botId: "9001",
+      botToken: "fake-bot-token",
+      dialogId: "chat8801",
+      fields: {
+        name: "stock-all-2026-01-15.xlsx",
+        content: "UEsDBA==",
+        message: "Stock across all warehouses",
+      },
+    });
+    expect(calls[0]?.options).toEqual({ timeoutMs: 60_000, retryTransportErrors: false });
+    expect(BITRIX24_FILE_UPLOAD_TIMEOUT_MS).toBe(60_000);
+  });
+
+  it("escapes BB-code brackets in the caption (plain text only)", async () => {
+    const { client, calls } = recordingClient();
+    await sendFile({
+      client,
+      botId: 1,
+      botToken: "t",
+      dialogId: "42",
+      fileName: "a.xlsx",
+      contentBase64: "UEsDBA==",
+      caption: "Stock at [b]Main[/b] [url=https://evil.example]x[/url]\u0000",
+    });
+    const message = (calls[0]?.params.fields as { message: string }).message;
+    expect(message).toBe(
+      "Stock at &#91;b&#93;Main&#91;/b&#93; &#91;url=https://evil.example&#93;x&#91;/url&#93;",
+    );
+    expect(message).not.toMatch(/[[\]]/);
+  });
+
+  it("omits fields.message when there is no caption", async () => {
+    const { client, calls } = recordingClient();
+    await sendFile({ client, botId: 1, botToken: "t", dialogId: "42", fileName: "a.xlsx", contentBase64: "UEsDBA==" });
+    expect(calls[0]?.params.fields).toEqual({ name: "a.xlsx", content: "UEsDBA==" });
+  });
+
+  it("passes the caller's abort signal through", async () => {
+    const { client, calls } = recordingClient();
+    const controller = new AbortController();
+    await sendFile({
+      client,
+      botId: 1,
+      botToken: "t",
+      dialogId: "42",
+      fileName: "a.xlsx",
+      contentBase64: "UEsDBA==",
+      signal: controller.signal,
+    });
+    expect((calls[0]?.options as { signal?: AbortSignal }).signal).toBe(controller.signal);
+  });
+
+  it("treats a response without a file id and a message id as a failure", async () => {
+    for (const result of [{}, true, null, { file: {}, messageId: null }]) {
+      const { client } = recordingClient(result);
+      await expect(
+        sendFile({ client, botId: 1, botToken: "t", dialogId: "42", fileName: "a.xlsx", contentBase64: "UEsDBA==" }),
+      ).rejects.toMatchObject({ code: "UPLOAD_UNCONFIRMED" });
+    }
+  });
+
+  it("propagates a Bitrix error (FILE_UPLOAD_FAILED)", async () => {
+    const client: Bitrix24Client = {
+      call: (async () => {
+        throw new Bitrix24Error({
+          method: "imbot.v2.File.upload",
+          code: "FILE_UPLOAD_FAILED",
+          description: "File upload failed",
+          status: 400,
+        });
+      }) as Bitrix24Client["call"],
+      describe: () => ({ host: "h", userId: "1" }),
+    };
+    await expect(
+      sendFile({ client, botId: 1, botToken: "t", dialogId: "42", fileName: "a.xlsx", contentBase64: "UEsDBA==" }),
+    ).rejects.toMatchObject({ code: "FILE_UPLOAD_FAILED" });
+  });
+
+  it("posts JSON to <base>imbot.v2.File.upload through the real client, once, even on a timeout", async () => {
+    const base = "https://acme.example.bitrix24.eu/rest/42/s3cr3tT0kenAAAA/";
+    const okFetch = vi.fn(async (url: unknown, init?: RequestInit) => {
+      expect(String(url)).toBe(`${base}imbot.v2.File.upload`);
+      expect(JSON.parse(String(init?.body))).toMatchObject({
+        dialogId: "42",
+        fields: { name: "a.xlsx", content: "UEsDBA==" },
+      });
+      return new Response(JSON.stringify({ result: { file: { id: 1 }, messageId: 2 } }), { status: 200 });
+    });
+    const client = createBitrix24Client({
+      baseUrl: base,
+      portalDomains: ["example.bitrix24.eu"],
+      fetchImpl: okFetch as unknown as typeof fetch,
+    });
+    await expect(
+      sendFile({ client, botId: 1, botToken: "t", dialogId: "42", fileName: "a.xlsx", contentBase64: "UEsDBA==" }),
+    ).resolves.toEqual({ fileId: "1", messageId: "2" });
+
+    const failingFetch = vi.fn(async () => {
+      throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    });
+    const failing = createBitrix24Client({
+      baseUrl: base,
+      portalDomains: ["example.bitrix24.eu"],
+      fetchImpl: failingFetch as unknown as typeof fetch,
+      sleep: async () => {},
+    });
+    await expect(
+      sendFile({ client: failing, botId: 1, botToken: "t", dialogId: "42", fileName: "a.xlsx", contentBase64: "UEsDBA==" }),
+    ).rejects.toMatchObject({ code: "TRANSPORT_ERROR" });
+    expect(failingFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("extracts ids from the documented response and tolerated aliases", () => {
+    expect(extractFileUploadResult({ file: { id: 138 }, messageId: 123 })).toEqual({ fileId: "138", messageId: "123" });
+    expect(extractFileUploadResult({ fileId: "9", message: { id: "10" } })).toEqual({ fileId: "9", messageId: "10" });
+    expect(extractFileUploadResult({ messageId: "not an id!" })).toEqual({ fileId: "", messageId: "" });
+  });
+});
 
 describe("escapeBbCode", () => {
   it("escapes both brackets so untrusted text cannot forge tags", () => {

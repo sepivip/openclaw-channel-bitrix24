@@ -15,14 +15,15 @@ This is a **community plugin** implementing Path B after Path A was rejected for
 
 ## Security Properties
 
-* **Hardcoded method allowlist**: exactly five methods allowed:
+* **Hardcoded method allowlist**: exactly six methods allowed:
   - `imbot.v2.Bot.register`
   - `imbot.v2.Bot.update`
   - `imbot.v2.Event.get`
   - `imbot.v2.Chat.Message.send`
   - `imbot.v2.Chat.InputAction.notify`
+  - `imbot.v2.File.upload` (called only by the [`bitrix24_send_sheet`](#sending-sheets-bitrix24_send_sheet) tool)
   
-  Any other method name throws synchronously. Scope creep is structurally impossible.
+  Any other method name throws synchronously. Scope creep is structurally impossible. All six need only the `imbot` scope.
 
 * **One base URL, validated at config load**: `https:` only, path must match `/rest/<digits>/<token>/`, host must end with the configured `portalDomain`.
 
@@ -34,7 +35,9 @@ This is a **community plugin** implementing Path B after Path A was rejected for
 
 * **Hard guard before policy**: Extranet chats, chats with collabers, Open Lines / entity-linked chats, non-`chat` group types, and extranet / connector / bot / external-auth senders are refused before config, ingress or any reply (`src/guard.ts`). Fail closed: a missing safety field on a group counts as unsafe.
 
-* **Loop guard**: `data.message.authorId === botId || data.user.bot === true` ⇒ dropped before ingress.
+* **Loop guard**: `data.message.authorId === botId || data.user.id === botId || data.user.bot === true` ⇒ dropped before ingress. This covers the bot's own file messages too.
+
+* **Files only through one tool**: replies never carry media. A file is sent only by the `bitrix24_send_sheet` agent tool, into the chat of the turn that called it. See [Sending sheets](#sending-sheets-bitrix24_send_sheet).
 
 * **Rate limits**: Token bucket 1.5 req/s, burst 20; exponential backoff with jitter on rate-limit errors; 20s timeout per request.
 
@@ -47,7 +50,7 @@ This is a **community plugin** implementing Path B after Path A was rejected for
 ```bash
 npm ci
 npm run build     # tsc -> dist/*.js
-npm test          # optional: 274 tests, no network egress
+npm test          # optional: 474 tests, no network egress
 ```
 
 ### 2. Deploy to Docker volume
@@ -236,21 +239,112 @@ renderers (`openclaw/plugin-sdk/interactive-runtime`): a presentation with
 other presentation, and legacy `interactive` buttons, are rendered as text
 lines (command buttons show the command; callback values are never shown).
 `channelData` is opaque transport data: with text the text is sent, alone it
-is declined. Media is never sent. A payload with nothing visible is declined
+is declined. Media in a reply is never sent (files go only through the
+`bitrix24_send_sheet` tool, below). A payload with nothing visible is declined
 with a warning naming the reply kind and the payload's key names; no content
 is logged, and no empty message is ever sent.
+
+## Sending sheets (`bitrix24_send_sheet`)
+
+The plugin registers one agent tool, `bitrix24_send_sheet`. It asks a local
+export service for a server-built `.xlsx` and posts it into the **current**
+Bitrix24 chat with `imbot.v2.File.upload`. The rows and the file bytes never
+pass through the model; the model gets a short summary computed by the server.
+
+**Arguments** (JSON Schema, `additionalProperties: false`):
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind"],
+  "properties": {
+    "kind": { "type": "string", "enum": ["stock"] },
+    "warehouse_code": { "type": "string", "pattern": "^[A-Za-z0-9-]{1,32}$" },
+    "as_of": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+    "lang": { "type": "string", "enum": ["en", "ka"] }
+  }
+}
+```
+
+There is no chat, dialog, user or target argument. The arguments are
+validated again at runtime, and any other key (`dialogId`, `chatId`, `to`,
+`target`, ...) is refused with `TARGET_NOT_ALLOWED`.
+
+**Where the file goes.** Only to the trusted turn context that core hands the
+tool (`deliveryContext`): its channel must be `bitrix24` and its target a
+numeric user id (DM) or `chat<N>` (group). Outside a Bitrix24 turn the tool
+refuses. The target is then checked again against the live config: a DM must
+be in `allowFrom` (and `dmPolicy` not `disabled`); a group needs
+`groupPolicy: "allowlist"` and a `groups` entry; the requesting sender, when
+core supplies one, must be in `allowFrom` (and, in a DM, own it).
+
+**Who may call it.** Only the agent the `bitrix24` channel routes to, read
+from `bindings`: `type` `"route"` (or missing), `match.channel: "bitrix24"`,
+and `match.accountId` `"*"`, this account, or omitted (the default account).
+No such binding, or bindings naming more than one agent: refused. The account
+must be running (its live client, bot id and bot token are used).
+
+**The export service.** One pinned URL, a constant in `src/sheets.ts`:
+`POST http://127.0.0.1:8765/exports/stock` (loopback; redirects are errors;
+180 s timeout). The bearer token comes from the gateway environment variable
+`ONESOFT_MCP_TOKEN`; missing or shorter than 32 characters, the tool refuses
+with `EXPORT_NOT_CONFIGURED` and makes no request. This is an outbound request
+on loopback only: the plugin still opens no port and registers no route.
+
+**Checks before upload.** The response is capped at 7.5 MiB before it is
+parsed. Then: `ok === true`; `file_name` matches
+`^[A-Za-z0-9._-]{1,120}\.xlsx$` (no leading dot); `mime_type` is exactly
+`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`;
+`content_base64` is canonical Base64; the bytes start with `PK\x03\x04` and are
+at most 5 MiB; every `summary` field has its exact type (integers, decimal
+strings, booleans, `YYYY-MM-DD`), rows never exceed the available total, and
+the warehouse matches the request.
+
+**Upload.** `imbot.v2.File.upload` with `{botId, botToken, dialogId, fields:
+{name, content, message}}`, a 60 s timeout, and no retry after a timeout or a
+transport error (a retry could post the file twice; rate-limit rejections are
+still retried). The caption is plain text built only from the server summary,
+in English or Georgian (`lang`), for example:
+`Stock at Main (WH-01) as of 2026-01-15: 2700 lines, total quantity 12345.678. Source: 1C copy.`
+When the export was truncated it adds
+`Truncated: <rows> of <total> lines shown. Total quantity of all lines: <total_quantity_all>.`
+
+**Result for the model.** Success:
+`{ok: true, file_name, rows, total_rows_available, total_quantity,
+total_quantity_all, as_of, warehouse_code, warehouse_name, truncated,
+message_id}`. Failure: `{ok: false, error_code, message}`; nothing is claimed
+as sent. An upload that fails, times out or returns neither a file id nor a
+message id is `UPLOAD_FAILED`.
+
+**Logs.** One line per call: on success
+`[bitrix24] sheet sent kind=stock dialog=<id> rows=<n> bytes=<n> file=<name> messageId=<id>`;
+on failure `[bitrix24] sheet not sent code=<CODE>`. The token, the export URL,
+the file bytes and row data are never logged.
+
+**Enabling it.** The tool is declared in `openclaw.plugin.json`
+(`contracts.tools`, with `toolMetadata` `optional: true`), so no agent sees it
+until its tool policy names it, for example `alsoAllow: ["bitrix24_send_sheet"]`
+on the Bitrix24 agent. A `deny` entry that covers plugin tools (such as
+`group:plugins`) blocks it, because deny wins over allow. The gateway needs
+`ONESOFT_MCP_TOKEN` in its environment and the export service listening on
+`127.0.0.1:8765` in the same network namespace.
 
 ## Testing
 
 Run tests locally:
 
 ```bash
-npm test          # vitest: 274 tests
+npm test          # vitest: 474 tests
 npm run typecheck # tsc --noEmit
 ```
 
 Tests include:
 - Unit tests for config, client, secrets, inbound/outbound handlers
+- The sheet tool and the export fetch (`test/tools.test.ts`,
+  `test/sheets.test.ts`): argument and target refusals, agent resolution from
+  bindings, every response-validation rejection, upload failures, captions,
+  log hygiene, registration, and the loop guard for the bot's own file message
 - Hard guard, mention detection, reply degradation and poller pacing
   (`test/guard.test.ts`, `test/mentions.test.ts`, `test/delivery.test.ts`,
   `test/poller.test.ts`)
@@ -281,6 +375,7 @@ After deployment:
 - [ ] Bot does not echo its own messages
 - [ ] Markdown formatting works (BBCode conversion)
 - [ ] Long messages are chunked correctly (4000-char limit)
+- [ ] If the sheet tool is enabled: a stock sheet request in an allowed DM posts a file from the bot, the log shows one `sheet sent` line, and the bot's own file message is not answered
 
 ## Troubleshooting
 

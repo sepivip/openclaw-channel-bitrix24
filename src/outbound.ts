@@ -7,6 +7,7 @@
 // Bitrix truncates at 20 000 chars with "(...)"; we chunk at 4 000.
 
 import type { Bitrix24Client } from "./client.js";
+import { Bitrix24Error } from "./secrets.js";
 
 export const BITRIX24_CHUNK_LIMIT = 4000;
 
@@ -201,6 +202,96 @@ function extractMessageId(result: unknown): string {
   const record = (result ?? {}) as { messageId?: unknown; id?: unknown };
   const candidate = record.messageId ?? record.id;
   return candidate === undefined || candidate === null ? "" : String(candidate);
+}
+
+/** Timeout for one `imbot.v2.File.upload` call (Bitrix cloud: 60 s per request). */
+export const BITRIX24_FILE_UPLOAD_TIMEOUT_MS = 60_000;
+
+export type Bitrix24SendFileParams = {
+  client: Bitrix24Client;
+  botId: number | string;
+  botToken: string;
+  /** Target dialog: `{userId}` for a DM, `chat{chatId}` for a group. */
+  dialogId: string;
+  /** File name with extension. The caller validates it. */
+  fileName: string;
+  /** File content, Base64 without a `data:` prefix. The caller validates it. */
+  contentBase64: string;
+  /** Plain text shown with the file. BB-code brackets are escaped here. */
+  caption?: string;
+  signal?: AbortSignal;
+};
+
+export type Bitrix24SendFileResult = {
+  fileId: string;
+  messageId: string;
+};
+
+/**
+ * Upload one file into a dialog as the bot: `imbot.v2.File.upload` uploads to
+ * the chat's Drive folder, attaches it and posts the message in one call.
+ *
+ * Request shape per apidocs (imbot.v2/files/file-upload): top-level `botId`,
+ * `botToken`, `dialogId`, and `fields.{name, content, message}`. Response:
+ * `{ file: { id, ... }, messageId, chatId, dialogId }`.
+ *
+ * A timeout or transport error is NOT retried (the upload may already have
+ * happened); it surfaces as a `Bitrix24Error`. A response without a file id
+ * and without a message id is treated as a failure, never as a success.
+ */
+export async function sendFile(params: Bitrix24SendFileParams): Promise<Bitrix24SendFileResult> {
+  const caption = typeof params.caption === "string" ? escapeBbCode(stripMarks(params.caption)) : "";
+  const result = await params.client.call<unknown>(
+    "imbot.v2.File.upload",
+    {
+      botId: params.botId,
+      botToken: params.botToken,
+      dialogId: params.dialogId,
+      fields: {
+        name: params.fileName,
+        content: params.contentBase64,
+        ...(caption ? { message: caption } : {}),
+      },
+    },
+    {
+      timeoutMs: BITRIX24_FILE_UPLOAD_TIMEOUT_MS,
+      retryTransportErrors: false,
+      ...(params.signal ? { signal: params.signal } : {}),
+    },
+  );
+  const extracted = extractFileUploadResult(result);
+  if (!extracted.fileId && !extracted.messageId) {
+    throw new Bitrix24Error({
+      method: "imbot.v2.File.upload",
+      code: "UPLOAD_UNCONFIRMED",
+      description: "imbot.v2.File.upload returned neither a file id nor a message id.",
+    });
+  }
+  return extracted;
+}
+
+function idOrEmpty(value: unknown): string {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  if (typeof value === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(value.trim())) {
+    return value.trim();
+  }
+  return "";
+}
+
+/** `{ file: { id }, messageId }` per apidocs; `fileId` / `message.id` tolerated. */
+export function extractFileUploadResult(result: unknown): Bitrix24SendFileResult {
+  const record = (result && typeof result === "object" ? result : {}) as {
+    file?: { id?: unknown };
+    fileId?: unknown;
+    messageId?: unknown;
+    message?: { id?: unknown };
+  };
+  return {
+    fileId: idOrEmpty(record.file?.id ?? record.fileId),
+    messageId: idOrEmpty(record.messageId ?? record.message?.id),
+  };
 }
 
 export type Bitrix24SendTypingParams = {

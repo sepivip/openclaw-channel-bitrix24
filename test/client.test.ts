@@ -18,14 +18,16 @@ function forbiddenFetch(): typeof fetch {
 }
 
 describe("method allowlist", () => {
-  it("accepts exactly the five imbot.v2 methods", () => {
+  it("accepts exactly the six imbot.v2 methods", () => {
     expect([...BITRIX24_METHOD_ALLOWLIST]).toEqual([
       "imbot.v2.Bot.register",
       "imbot.v2.Bot.update",
       "imbot.v2.Event.get",
       "imbot.v2.Chat.Message.send",
       "imbot.v2.Chat.InputAction.notify",
+      "imbot.v2.File.upload",
     ]);
+    expect(BITRIX24_METHOD_ALLOWLIST).toHaveLength(6);
     for (const method of BITRIX24_METHOD_ALLOWLIST) {
       expect(() => assertAllowedBitrix24Method(method)).not.toThrow();
     }
@@ -56,6 +58,11 @@ describe("method allowlist", () => {
     "calendar.event.get",
     "imbot.message.add",
     "imbot.v2.Chat.Message.send ",
+    "im.v2.File.upload",
+    "imbot.v2.file.upload",
+    "imbot.v2.File.download",
+    "disk.folder.uploadfile",
+    "im.disk.file.commit",
   ])("rejects %s", (method) => {
     expect(() => assertAllowedBitrix24Method(method)).toThrow(Bitrix24Error);
   });
@@ -241,6 +248,95 @@ describe("client call path", () => {
       code: "OPERATION_TIME_LIMIT",
     });
     expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it("uses a per-call timeout override and can skip transport retries", async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new TypeError("fetch failed");
+    });
+    const client = createBitrix24Client({
+      baseUrl: GOOD_URL,
+      portalDomains: PORTAL_DOMAINS,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: async () => {},
+      random: () => 0.5,
+    });
+    let thrown: unknown;
+    try {
+      await client.call("imbot.v2.File.upload", {}, { timeoutMs: 60_000, retryTransportErrors: false });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Bitrix24Error);
+    expect((thrown as Bitrix24Error).code).toBe("TRANSPORT_ERROR");
+    expect((thrown as Bitrix24Error).description).toContain("60000ms");
+    // Not retried: a retried upload could post the file twice.
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the default timeout and transport retries when no override is given", async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new TypeError("fetch failed");
+    });
+    const client = createBitrix24Client({
+      baseUrl: GOOD_URL,
+      portalDomains: PORTAL_DOMAINS,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      maxRetries: 2,
+      sleep: async () => {},
+      random: () => 0.5,
+    });
+    await expect(client.call("imbot.v2.Chat.Message.send", {})).rejects.toMatchObject({
+      code: "TRANSPORT_ERROR",
+      description: expect.stringContaining("20000ms"),
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([0, -1, 1.5, 10_000_000, Number.NaN])(
+    "ignores an invalid timeout override (%s) and falls back to 20 s",
+    async (timeoutMs) => {
+      const fetchImpl = vi.fn(async () => {
+        throw new TypeError("fetch failed");
+      });
+      const client = createBitrix24Client({
+        baseUrl: GOOD_URL,
+        portalDomains: PORTAL_DOMAINS,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        maxRetries: 0,
+      });
+      await expect(client.call("imbot.v2.Event.get", {}, { timeoutMs })).rejects.toMatchObject({
+        description: expect.stringContaining("20000ms"),
+      });
+    },
+  );
+
+  it("still retries a rate-limit response when transport retries are off", async () => {
+    let calls = 0;
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return new Response(
+          JSON.stringify({ error: "QUERY_LIMIT_EXCEEDED", error_description: "too fast" }),
+          { status: 503, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ result: { messageId: 5 } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    const client = createBitrix24Client({
+      baseUrl: GOOD_URL,
+      portalDomains: PORTAL_DOMAINS,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: async () => {},
+      random: () => 0.5,
+    });
+    await expect(
+      client.call("imbot.v2.File.upload", {}, { retryTransportErrors: false }),
+    ).resolves.toEqual({ messageId: 5 });
+    expect(calls).toBe(2);
   });
 
   it("describe() exposes only host and webhook user id", () => {
