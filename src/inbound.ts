@@ -198,11 +198,17 @@ export function resolveBitrix24ChatKind(chat: Bitrix24RawChat | undefined): Bitr
  *
  * `data.user.bot` is the documented field name (`ONIMBOTV2MESSAGEADD` sample:
  * `"bot": false` inside `user`); `isBot` is accepted as a tolerant alias.
+ * `data.user.id === botId` also counts on its own, so the bot's own message
+ * (for example a file it posted) is dropped even when `authorId` is absent.
  */
 export function isOwnBitrix24Event(raw: Bitrix24RawEvent, botId: string | number): boolean {
   const authorId = asId(raw.data?.message?.authorId);
   const self = asId(botId);
   if (self && authorId && authorId === self) {
+    return true;
+  }
+  const userId = asId(raw.data?.user?.id);
+  if (self && userId && userId === self) {
     return true;
   }
   const eventBotId = asId(raw.data?.bot?.id);

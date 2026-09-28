@@ -199,6 +199,23 @@ type Bitrix24AccountRuntime = {
 /** Live accounts, keyed by accountId. Populated by `startAccount` only. */
 const runningAccounts = new Map<string, Bitrix24AccountRuntime>();
 
+/**
+ * The live client, botId and botToken of a RUNNING account, for the
+ * `bitrix24_send_sheet` tool. `undefined` when the account is not running:
+ * the tool then refuses. Unlike `resolveOutboundContext` there is no fallback
+ * that re-resolves secrets, so a file is only ever sent by a started account.
+ * Never log the returned object.
+ */
+export function getRunningBitrix24AccountRuntime(
+  accountId: string,
+): { client: Bitrix24Client; botId: string; botToken: string } | undefined {
+  const entry = runningAccounts.get(accountId);
+  if (!entry || !entry.botId || !entry.botToken) {
+    return undefined;
+  }
+  return { client: entry.client, botId: entry.botId, botToken: entry.botToken };
+}
+
 /** Diagnostics/test accessor. Contains no credential material. */
 export function inspectRunningBitrix24Account(
   accountId: string,
