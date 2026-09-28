@@ -1,6 +1,7 @@
 // Poller pacing: after an Event.get page with `hasMore: true`, Bitrix requires
-// at least 2 s before the next Event.get. Fake timers, the poller's real
-// (default) abortable sleep, and a scripted fake client.
+// at least 2 s before the next Event.get. Also what a stop in the middle of a
+// batch acknowledges. Fake timers, the poller's real (default) abortable
+// sleep, and a scripted fake client.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -131,4 +132,89 @@ describe("hasMore pacing", () => {
     expect(callTimes).toHaveLength(1);
     expect(poller.snapshot().running).toBe(false);
   });
+});
+
+describe("stop in the middle of a batch", () => {
+  /** A handler whose first event stays in flight until `release()`. */
+  function heldHandler() {
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let handed = 0;
+    const onEvents = vi.fn(async (_events: unknown[]) => {
+      handed += 1;
+      if (handed === 1) {
+        await held;
+      }
+    });
+    return { onEvents, release: () => release() };
+  }
+
+  function buildStoredPoller(client: Bitrix24Client, onEvents: (events: unknown[]) => Promise<void>) {
+    const stateStore = createMemoryStateStore();
+    const poller = createBitrix24Poller({
+      client,
+      accountId: "mid-batch",
+      botId: "9001",
+      botToken: "fake-bot-token",
+      stateStore,
+      idleMs: 60_000,
+      activeMs: 60_000,
+      onEvents,
+    });
+    return { poller, stateStore };
+  }
+
+  it("waits for the event in flight only and acknowledges just the events handed over", async () => {
+    const { client, callTimes } = scriptedClient([
+      {
+        events: [{ eventId: 11 }, { eventId: 12 }, { eventId: 13 }],
+        nextOffset: 14,
+        hasMore: false,
+      },
+    ]);
+    const { onEvents, release } = heldHandler();
+    const { poller, stateStore } = buildStoredPoller(client, onEvents);
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onEvents).toHaveBeenCalledTimes(1);
+
+    let stopped = false;
+    const stopping = poller.stop().then(() => {
+      stopped = true;
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(stopped).toBe(false); // the turn in flight is not abandoned
+
+    release();
+    await stopping;
+    // Event 11 was handed over; 12 and 13 were not, so the saved offset is
+    // 12 ("confirms all events with IDs less than" it), not the batch's 14.
+    expect(onEvents.mock.calls).toEqual([[[{ eventId: 11 }]]]);
+    expect(await stateStore.get("offset")).toBe("12");
+    expect(poller.snapshot().offset).toBe("12");
+    expect(callTimes).toHaveLength(1);
+  });
+
+  it.each([
+    ["no integer event ids", [{ eventId: "evt-a" }, { eventId: "evt-b" }, {}]],
+    ["ids outside the batch's offset range", [{ eventId: 20 }, { eventId: 21 }, { eventId: 22 }]],
+  ])(
+    "with %s it hands the rest over instead of dropping or replaying it",
+    async (_label, events) => {
+      const { client } = scriptedClient([{ events, nextOffset: 14, hasMore: false }]);
+      const { onEvents, release } = heldHandler();
+      const { poller, stateStore } = buildStoredPoller(client, onEvents);
+      poller.start();
+      await vi.advanceTimersByTimeAsync(0);
+      const stopping = poller.stop();
+      release();
+      await stopping;
+      // No offset can acknowledge part of this batch, so all of it is
+      // handled and the batch's own nextOffset is saved.
+      expect(onEvents.mock.calls).toEqual(events.map((event) => [[event]]));
+      expect(await stateStore.get("offset")).toBe("14");
+    },
+  );
 });

@@ -7,7 +7,9 @@
 //    Not passed on the first call."
 //   After `hasMore: true`, wait at least 2 s before the next Event.get.
 // So `nextOffset` is the ack: persisting it before the next call is what makes
-// a restart neither replay nor skip (design §2.2 "Idempotency").
+// a restart neither replay nor skip (design §2.2 "Idempotency"). A stop can end
+// a batch between two events; the offset saved then is the id of the first
+// event not handed over, so the next start fetches exactly the rest.
 //
 // This module makes no network call on import. `start()` is only reached from
 // `gateway.startAccount` after fail-closed secret validation.
@@ -33,7 +35,12 @@ export type Bitrix24PollerOptions = {
   stateStore: StateStore;
   idleMs: number;
   activeMs: number;
-  /** Called once per batch. Must not throw for individual bad events. */
+  /**
+   * Handed one event at a time (a one-element array), in batch order, so a
+   * stop can end a batch between two events. Must not throw for individual
+   * bad events, and must not skip an event it was handed: it counts as
+   * handled once this returns.
+   */
   onEvents: (events: unknown[]) => Promise<void> | void;
   log?: (message: string) => void;
   /** Account health transitions. Never throws out of the loop. */
@@ -101,6 +108,37 @@ export function parseBitrix24EventBatch(result: unknown): Bitrix24EventBatch {
       ? undefined
       : String(record.nextOffset);
   return { events, nextOffset, hasMore: record.hasMore === true };
+}
+
+function toEventNumber(value: unknown): number | undefined {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && /^\d+$/.test(value.trim())
+        ? Number(value.trim())
+        : Number.NaN;
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+/**
+ * The offset that acknowledges every event of a batch before `event` and none
+ * from it on: its own `eventId` (Event.get `offset` "Confirms all events with
+ * IDs less than the specified value"). Only an integer id inside the batch's
+ * own range (`offset` <= id < `nextOffset`) qualifies, so an id that is not an
+ * Event.get offset can never acknowledge an event that was not handed over.
+ * `undefined` otherwise; a stop then does not end the batch in front of it.
+ */
+export function bitrix24OffsetBefore(
+  event: unknown,
+  batch: { offset: string | undefined; nextOffset: string | undefined },
+): string | undefined {
+  const id = toEventNumber((event as { eventId?: unknown } | null | undefined)?.eventId);
+  const low = batch.offset === undefined ? 0 : toEventNumber(batch.offset);
+  const high = toEventNumber(batch.nextOffset);
+  if (id === undefined || low === undefined || high === undefined || id < low || id >= high) {
+    return undefined;
+  }
+  return String(id);
 }
 
 export function createBitrix24Poller(options: Bitrix24PollerOptions): Bitrix24Poller {
@@ -174,14 +212,34 @@ export function createBitrix24Poller(options: Bitrix24PollerOptions): Bitrix24Po
         // (abortable) between pages as the Event.get contract requires.
         for (;;) {
           const batch = await fetchOnce(signal);
-          if (batch.events.length > 0) {
+          let ackOffset = batch.nextOffset;
+          // One event at a time, so a stop (a channel restart after a config
+          // change, or shutdown) ends the batch between two events: each event
+          // is awaited through its whole agent turn, which can take minutes,
+          // and a stop should wait for the turn in flight only.
+          for (const event of batch.events) {
+            if (signal.aborted) {
+              const before = bitrix24OffsetBefore(event, {
+                offset,
+                nextOffset: batch.nextOffset,
+              });
+              if (before !== undefined) {
+                // Acknowledge only what was handed over; the next start
+                // fetches the rest from here.
+                ackOffset = before;
+                break;
+              }
+              // No usable id to acknowledge up to: hand it over too, rather
+              // than drop it (acknowledged, never handled) or replay the
+              // events already handled.
+            }
             sawEvents = true;
-            events += batch.events.length;
-            await options.onEvents(batch.events);
+            events += 1;
+            await options.onEvents([event]);
           }
-          // Ack only AFTER the batch was handed to the handler.
-          if (batch.nextOffset !== undefined && batch.nextOffset !== offset) {
-            offset = batch.nextOffset;
+          // Ack only AFTER the events were handed to the handler.
+          if (ackOffset !== undefined && ackOffset !== offset) {
+            offset = ackOffset;
             await options.stateStore.set(offsetKey, offset);
           }
           if (!batch.hasMore || signal.aborted) {

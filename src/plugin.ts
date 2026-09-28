@@ -241,6 +241,14 @@ export const bitrix24Plugin = createChatChannelPlugin<ResolvedBitrix24Account>({
     // when groupPolicy is "allowlist" AND the chat is listed in `groups`
     // (inbound.ts), and it passes the hard guard (guard.ts).
     capabilities: { chatTypes: ["direct", "group"] },
+    // A change under channels.bitrix24.* (a chat approved in `groups`,
+    // `groupPolicy`, `allowFrom`, the poll timings) restarts only this channel.
+    // `startAccount` reads the config once, so the account needs a restart to
+    // see a change, but not a whole-gateway one: without this rule the reload
+    // planner matches nothing for these paths and restarts the gateway. No
+    // `accountScopedRestart`: the config is single-account at the top level,
+    // so an account id can not be read from these paths.
+    reload: { configPrefixes: ["channels.bitrix24"] },
     configSchema: bitrix24ChannelConfigSchema,
     config: {
       listAccountIds: listBitrix24AccountIds,
