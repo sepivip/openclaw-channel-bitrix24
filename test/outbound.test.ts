@@ -93,13 +93,45 @@ describe("sendFile (imbot.v2.File.upload)", () => {
     expect((calls[0]?.options as { signal?: AbortSignal }).signal).toBe(controller.signal);
   });
 
-  it("treats a response without a file id and a message id as a failure", async () => {
-    for (const result of [{}, true, null, { file: {}, messageId: null }]) {
-      const { client } = recordingClient(result);
-      await expect(
-        sendFile({ client, botId: 1, botToken: "t", dialogId: "42", fileName: "a.xlsx", contentBase64: "UEsDBA==" }),
-      ).rejects.toMatchObject({ code: "UPLOAD_UNCONFIRMED" });
-    }
+  it.each([
+    ["an empty object", {}],
+    ["true", true],
+    ["null", null],
+    ["undefined (an unreadable 200 body)", undefined],
+    ["no ids", { file: {}, messageId: null }],
+    ["a file id only", { file: { id: 138 } }],
+    ["a fileId alias only", { fileId: "138" }],
+    ["messageId 0", { file: { id: 138 }, messageId: 0 }],
+    ["messageId null", { file: { id: 138 }, messageId: null }],
+    ["messageId \"\"", { file: { id: 138 }, messageId: "" }],
+    ["messageId \"0\"", { file: { id: 138 }, messageId: "0" }],
+    ["messageId \"000\"", { file: { id: 138 }, messageId: "000" }],
+    ["a negative messageId", { file: { id: 138 }, messageId: -5 }],
+    ["a fractional messageId", { file: { id: 138 }, messageId: 1.5 }],
+    ["a non-numeric messageId", { file: { id: 138 }, messageId: "abc" }],
+    ["message.id 0", { file: { id: 138 }, message: { id: 0 } }],
+  ])("treats a response with %s as UPLOAD_UNCONFIRMED, never a success", async (_label, result) => {
+    // Not recordingClient: its default parameter would replace `undefined`.
+    const client: Bitrix24Client = {
+      call: (async () => result) as Bitrix24Client["call"],
+      describe: () => ({ host: "h", userId: "1" }),
+    };
+    await expect(
+      sendFile({ client, botId: 1, botToken: "t", dialogId: "42", fileName: "a.xlsx", contentBase64: "UEsDBA==" }),
+    ).rejects.toMatchObject({ code: "UPLOAD_UNCONFIRMED", method: "imbot.v2.File.upload", status: undefined });
+  });
+
+  it.each([
+    [{ file: { id: 138 }, messageId: 123 }, "123"],
+    [{ file: { id: 138 }, messageId: "123" }, "123"],
+    [{ file: { id: 138 }, messageId: "0100" }, "0100"],
+    [{ messageId: 7 }, "7"],
+    [{ message: { id: "10" } }, "10"],
+  ])("accepts a positive message id (%j)", async (result, messageId) => {
+    const { client } = recordingClient(result);
+    await expect(
+      sendFile({ client, botId: 1, botToken: "t", dialogId: "42", fileName: "a.xlsx", contentBase64: "UEsDBA==" }),
+    ).resolves.toMatchObject({ messageId });
   });
 
   it("propagates a Bitrix error (FILE_UPLOAD_FAILED)", async () => {
@@ -157,6 +189,26 @@ describe("sendFile (imbot.v2.File.upload)", () => {
     expect(extractFileUploadResult({ file: { id: 138 }, messageId: 123 })).toEqual({ fileId: "138", messageId: "123" });
     expect(extractFileUploadResult({ fileId: "9", message: { id: "10" } })).toEqual({ fileId: "9", messageId: "10" });
     expect(extractFileUploadResult({ messageId: "not an id!" })).toEqual({ fileId: "", messageId: "" });
+    // The message id must be a positive integer; the file id alone is kept but proves nothing.
+    expect(extractFileUploadResult({ file: { id: 138 }, messageId: 0 })).toEqual({ fileId: "138", messageId: "" });
+    expect(extractFileUploadResult({ file: { id: 138 }, messageId: "abc" })).toEqual({ fileId: "138", messageId: "" });
+    expect(extractFileUploadResult({ messageId: " 42 " })).toEqual({ fileId: "", messageId: "42" });
+  });
+
+  it("a bare 503 or 429 on File.upload reaches the caller after one request (no retry)", async () => {
+    for (const status of [503, 429]) {
+      const fetchImpl = vi.fn(async () => new Response("<html>busy</html>", { status }));
+      const client = createBitrix24Client({
+        baseUrl: "https://acme.example.bitrix24.eu/rest/42/s3cr3tT0kenAAAA/",
+        portalDomains: ["example.bitrix24.eu"],
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        sleep: async () => {},
+      });
+      await expect(
+        sendFile({ client, botId: 1, botToken: "t", dialogId: "42", fileName: "a.xlsx", contentBase64: "UEsDBA==" }),
+      ).rejects.toMatchObject({ code: `http_${status}`, status });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    }
   });
 });
 

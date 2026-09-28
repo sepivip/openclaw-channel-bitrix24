@@ -7,22 +7,27 @@
 //     route), and must be a bitrix24 route with a numeric DM id or `chat<N>`.
 //     Arguments are re-validated at runtime and any key beyond the four
 //     declared ones (dialogId, chatId, to, target, ...) is refused.
+//   * A requesting Bitrix24 user is required (`requesterSenderId`). A call
+//     without one (an operator `/tools/invoke`, a cron or subagent run that
+//     only carries a bitrix24 deliveryContext) is not a Bitrix turn: refuse.
 //   * Only the agent the bitrix24 channel routes to may send, resolved from
 //     the config's `bindings` (a `route` binding for channel "bitrix24" whose
 //     accountId is "*", this account, or omitted for the default account). No
 //     binding, or bindings naming more than one agent: refuse.
 //   * Defence in depth against the live account config: a DM target must be
 //     in `allowFrom`; a group target needs groupPolicy "allowlist" and a
-//     `groups` entry; a known sender must be in `allowFrom`.
+//     `groups` entry; the sender must be in `allowFrom` (and own the DM).
 //   * Only a RUNNING account's client/botId/botToken is used.
 //   * The rows and bytes never reach the model: the model gets the server's
 //     summary, and the Bitrix caption is built from that summary only.
 //   * Failure is `{ ok: false, error_code, message }` plus ONE warning line
-//     with the code. Success is claimed only after Bitrix confirmed the upload.
+//     with the code. Success is claimed only when Bitrix returned a message
+//     id. An upload that may have landed but was not confirmed is
+//     `UPLOAD_UNCONFIRMED`, and the model is told not to send it again.
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import type { AnyAgentTool, OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
-import type { Bitrix24Client } from "./client.js";
+import { isExplicitBitrix24Rejection, type Bitrix24Client } from "./client.js";
 import {
   BITRIX24_CHANNEL_ID,
   listBitrix24AccountIds,
@@ -113,7 +118,11 @@ const TOOL_DESCRIPTION =
   "The file always goes to the conversation you are answering; no other chat or user can be chosen. " +
   "The rows and totals are computed by the server and are not shown to you. " +
   "Quote the totals from the result exactly, never your own sums. " +
-  "Say the file was sent only when the result has ok: true; otherwise say it was not sent.";
+  "Say the file was sent only when the result has ok: true. " +
+  "If error_code is UPLOAD_UNCONFIRMED, do not call this tool again: tell the user the file may " +
+  "already be in the chat and ask them to check. " +
+  "If error_code is EXPORT_TOO_LARGE, do not retry the same request: suggest a sheet for one warehouse. " +
+  "For any other failure, say the file was not sent.";
 
 export type SendSheetArgs = {
   kind: "stock";
@@ -137,6 +146,7 @@ export type SendSheetErrorCode =
   | "SENDER_NOT_ALLOWED"
   | "ACCOUNT_NOT_RUNNING"
   | "UPLOAD_FAILED"
+  | "UPLOAD_UNCONFIRMED"
   | "ABORTED"
   | "INTERNAL_ERROR"
   | `EXPORT_${string}`;
@@ -152,6 +162,8 @@ export type SendSheetSuccess = {
   warehouse_code: string | null;
   warehouse_name: string | null;
   truncated: boolean;
+  items_without_name: number;
+  null_amounts: number;
   message_id: string;
 };
 
@@ -289,12 +301,19 @@ export function resolveBitrix24RouteAgentId(
   return { ok: true, agentId: only };
 }
 
-type TurnTarget = { dialogId: string; kind: "direct" | "group"; accountId: string };
+type TurnTarget = { dialogId: string; kind: "direct" | "group"; accountId: string; senderId: string };
 
 function resolveTurnTarget(context: OpenClawPluginToolContext, cfg: OpenClawConfig): TurnTarget {
   const delivery = context.deliveryContext;
   if (!delivery || normalizeId(delivery.channel) !== BITRIX24_CHANNEL_ID) {
     refuse("NOT_A_BITRIX_TURN", "this tool only works while answering a Bitrix24 chat");
+  }
+  // A real Bitrix turn always names the user who wrote. A bitrix24
+  // deliveryContext without one (operator /tools/invoke, cron, subagent) has
+  // nobody asking for the file.
+  const senderId = typeof context.requesterSenderId === "string" ? context.requesterSenderId.trim() : "";
+  if (!senderId) {
+    refuse("NOT_A_BITRIX_TURN", "no requesting Bitrix24 user on this turn");
   }
   const to = typeof delivery.to === "string" ? delivery.to.trim() : "";
   let kind: TurnTarget["kind"];
@@ -314,7 +333,7 @@ function resolveTurnTarget(context: OpenClawPluginToolContext, cfg: OpenClawConf
   if (!listBitrix24AccountIds(cfg).includes(accountId)) {
     refuse("UNKNOWN_ACCOUNT", "the current turn is not on a known Bitrix24 account");
   }
-  return { dialogId: to, kind, accountId };
+  return { dialogId: to, kind, accountId, senderId };
 }
 
 function assertAgentAllowed(context: OpenClawPluginToolContext, cfg: OpenClawConfig, accountId: string): void {
@@ -333,11 +352,7 @@ function assertAgentAllowed(context: OpenClawPluginToolContext, cfg: OpenClawCon
   }
 }
 
-function assertTargetAllowedByConfig(
-  context: OpenClawPluginToolContext,
-  cfg: OpenClawConfig,
-  target: TurnTarget,
-): void {
+function assertTargetAllowedByConfig(cfg: OpenClawConfig, target: TurnTarget): void {
   let account: ResolvedBitrix24Account;
   try {
     account = resolveBitrix24Account(cfg, target.accountId);
@@ -354,14 +369,12 @@ function assertTargetAllowedByConfig(
   } else if (account.groupPolicy !== "allowlist" || !account.groups[target.dialogId]) {
     refuse("GROUP_TARGET_NOT_ALLOWED", "this group chat is not an approved Bitrix24 chat");
   }
-  const sender = typeof context.requesterSenderId === "string" ? context.requesterSenderId.trim() : "";
-  if (sender) {
-    if (!NUMERIC_ID_RE.test(sender) || !account.allowFrom.includes(sender)) {
-      refuse("SENDER_NOT_ALLOWED", "the requesting user is not on the Bitrix24 allowlist");
-    }
-    if (target.kind === "direct" && sender !== target.dialogId) {
-      refuse("SENDER_NOT_ALLOWED", "the requesting user does not own this DM");
-    }
+  const sender = target.senderId;
+  if (!NUMERIC_ID_RE.test(sender) || !account.allowFrom.includes(sender)) {
+    refuse("SENDER_NOT_ALLOWED", "the requesting user is not on the Bitrix24 allowlist");
+  }
+  if (target.kind === "direct" && sender !== target.dialogId) {
+    refuse("SENDER_NOT_ALLOWED", "the requesting user does not own this DM");
   }
 }
 
@@ -407,6 +420,9 @@ export function buildStockSheetCaption(summary: StockExportSummary, lang: SheetL
         ` შეკვეცილია: ნაჩვენებია ${summary.rows} სტრიქონი ${summary.total_rows_available}-დან.` +
         ` ყველა სტრიქონის ჯამური რაოდენობა: ${summary.total_quantity_all}.`;
     }
+    if (summary.items_without_name > 0) {
+      text += ` ${summary.items_without_name} სტრიქონს არ აქვს საქონლის დასახელება.`;
+    }
     return text;
   }
   const where =
@@ -422,6 +438,10 @@ export function buildStockSheetCaption(summary: StockExportSummary, lang: SheetL
     text +=
       ` Truncated: ${summary.rows} of ${summary.total_rows_available} lines shown.` +
       ` Total quantity of all lines: ${summary.total_quantity_all}.`;
+  }
+  const unnamed = summary.items_without_name;
+  if (unnamed > 0) {
+    text += unnamed === 1 ? " 1 line has no item name." : ` ${unnamed} lines have no item name.`;
   }
   return text;
 }
@@ -453,20 +473,29 @@ function logAt(log: Bitrix24Log | undefined, level: "info" | "warn", text: strin
   console.log(text);
 }
 
-function describeUploadFailure(error: unknown): string {
-  if (error instanceof Bitrix24Error) {
+/**
+ * Turn a failed upload into a refusal. `UPLOAD_FAILED` only when Bitrix
+ * explicitly rejected the request (see `isExplicitBitrix24Rejection`), so the
+ * file is known not to be in the chat. Everything else (transport error,
+ * timeout, abort mid-upload, 5xx/429 without a code, an unreadable body, no
+ * message id) may have posted the file: `UPLOAD_UNCONFIRMED`.
+ */
+function refuseUpload(error: unknown): never {
+  if (error instanceof Bitrix24Error && isExplicitBitrix24Rejection(error)) {
     const code = SAFE_CODE_RE.test(error.code) ? error.code : "UNKNOWN";
-    if (code === "TRANSPORT_ERROR") {
-      return "Bitrix24 upload failed or timed out; the file was not confirmed as sent";
-    }
-    return `Bitrix24 upload failed (${code}); the file was not sent`;
+    refuse("UPLOAD_FAILED", `Bitrix24 refused the upload (${code}); the file was not sent`);
   }
-  return "Bitrix24 upload failed; the file was not sent";
+  refuse(
+    "UPLOAD_UNCONFIRMED",
+    "the upload may already be in the chat; it could not be confirmed. " +
+      "Ask the user to check the chat and do not send it again",
+  );
 }
 
 /**
  * Run one `bitrix24_send_sheet` call. Never throws: every outcome is a
- * `SendSheetResult`. Logs exactly one line: info on success, warn on failure.
+ * `SendSheetResult`. Logs exactly one line: info on success, warn otherwise
+ * (`sheet unconfirmed` for `UPLOAD_UNCONFIRMED`, `sheet not sent` for the rest).
  */
 export async function runBitrix24SendSheet(
   deps: Bitrix24SendSheetDeps,
@@ -478,7 +507,7 @@ export async function runBitrix24SendSheet(
     const cfg = readConfig(deps.context);
     const target = resolveTurnTarget(deps.context, cfg);
     assertAgentAllowed(deps.context, cfg, target.accountId);
-    assertTargetAllowedByConfig(deps.context, cfg, target);
+    assertTargetAllowedByConfig(cfg, target);
     const runtime = deps.getAccountRuntime(target.accountId);
     if (!runtime) {
       refuse("ACCOUNT_NOT_RUNNING", "the Bitrix24 account is not running");
@@ -502,6 +531,9 @@ export async function runBitrix24SendSheet(
     }
 
     const summary = exported.summary;
+    const caption = buildStockSheetCaption(summary, args.lang ?? "en");
+    // Once sendFile is called the upload may have started: every failure,
+    // an abort included, goes through refuseUpload and is never ABORTED.
     let uploaded: { fileId: string; messageId: string };
     try {
       uploaded = await sendFile({
@@ -511,18 +543,18 @@ export async function runBitrix24SendSheet(
         dialogId: target.dialogId,
         fileName: exported.fileName,
         contentBase64: exported.contentBase64,
-        caption: buildStockSheetCaption(summary, args.lang ?? "en"),
+        caption,
         ...(signal ? { signal } : {}),
       });
     } catch (error) {
-      refuse("UPLOAD_FAILED", describeUploadFailure(error));
+      refuseUpload(error);
     }
 
     logAt(
       deps.log,
       "info",
       `[bitrix24] sheet sent kind=stock dialog=${target.dialogId} rows=${summary.rows} ` +
-        `bytes=${exported.byteLength} file=${exported.fileName} messageId=${uploaded.messageId || "?"}`,
+        `bytes=${exported.byteLength} file=${exported.fileName} messageId=${uploaded.messageId}`,
     );
     return {
       ok: true,
@@ -535,6 +567,8 @@ export async function runBitrix24SendSheet(
       warehouse_code: summary.warehouse_code,
       warehouse_name: summary.warehouse_name,
       truncated: summary.truncated,
+      items_without_name: summary.items_without_name,
+      null_amounts: summary.null_amounts,
       message_id: uploaded.messageId,
     };
   } catch (error) {
@@ -552,7 +586,9 @@ export async function runBitrix24SendSheet(
     } else {
       failure = { ok: false, error_code: "INTERNAL_ERROR", message: "unexpected error; the file was not sent" };
     }
-    logAt(deps.log, "warn", `[bitrix24] sheet not sent code=${failure.error_code}`);
+    // An unconfirmed upload may be in the chat: do not log it as "not sent".
+    const outcome = failure.error_code === "UPLOAD_UNCONFIRMED" ? "unconfirmed" : "not sent";
+    logAt(deps.log, "warn", `[bitrix24] sheet ${outcome} code=${failure.error_code}`);
     return failure;
   }
 }

@@ -10,7 +10,8 @@
 //   * Every failure is wrapped into `Bitrix24Error { method, code, description }`
 //     before it can reach a logger. The webhook URL is never a field anywhere.
 //   * Token bucket 1.5 req/s burst 20; backoff on QUERY_LIMIT_EXCEEDED (503)
-//     and OPERATION_TIME_LIMIT (429).
+//     and OPERATION_TIME_LIMIT (429). A call that is not idempotent retries on
+//     those explicit codes only, never on a bare 429/503.
 //   * Node 22 global `fetch` only. No third-party HTTP client, no runtime dependency.
 
 import { Bitrix24ConfigError, Bitrix24Error } from "./secrets.js";
@@ -36,11 +37,19 @@ export type Bitrix24Method = (typeof BITRIX24_METHOD_ALLOWLIST)[number];
 
 const ALLOWED_METHODS: ReadonlySet<string> = new Set<string>(BITRIX24_METHOD_ALLOWLIST);
 
-/** Bitrix rate-limit codes that are worth retrying with backoff. */
+/**
+ * Bitrix rate-limit codes that are worth retrying with backoff. Bitrix sends
+ * them when it blocks a call before running the method (request intensity
+ * limit; method blocked for exceeding its operation time budget), so a retry
+ * cannot repeat work that already happened.
+ */
 const RETRYABLE_CODES: ReadonlySet<string> = new Set([
   "QUERY_LIMIT_EXCEEDED",
   "OPERATION_TIME_LIMIT",
 ]);
+
+/** `http_<status>`: the code this client makes up for a response without a Bitrix code. */
+const SYNTHETIC_HTTP_CODE_RE = /^http_\d+$/;
 
 export const BITRIX24_DEFAULT_TIMEOUT_MS = 20_000;
 export const BITRIX24_DEFAULT_RATE_PER_SEC = 1.5;
@@ -240,11 +249,13 @@ export type Bitrix24CallOptions = {
    */
   timeoutMs?: number;
   /**
-   * `false` = a transport failure or timeout is NOT retried. For a call that
-   * is not idempotent (a file upload): the first request may already have
-   * been processed, and a retry would post the file twice. Rate-limit
-   * responses, which Bitrix rejects before doing anything, are still retried.
-   * Default `true`, the historical behaviour.
+   * `false` = a transport failure, a timeout, or a bare HTTP 429/503 without
+   * a Bitrix error code is NOT retried. For a call that is not idempotent (a
+   * file upload): the first request may already have been processed (a proxy
+   * can answer 503 after Bitrix did the work), and a retry would post the
+   * file twice. Only an explicit rate-limit code (`RETRYABLE_CODES`), which
+   * Bitrix sends when it rejected the call before running it, is still
+   * retried. Default `true`, the historical behaviour.
    */
   retryTransportErrors?: boolean;
 };
@@ -297,6 +308,24 @@ function describeEnvelopeError(method: string, status: number, body: unknown): B
       ? envelope.error_description
       : `Bitrix24 returned HTTP ${status}.`;
   return new Bitrix24Error({ method, code, description, status });
+}
+
+/**
+ * True only when Bitrix answered with an explicit error code in a JSON body
+ * that means it REJECTED the request: any code on a 2xx/4xx response, or a
+ * rate-limit code on any status. False for everything this client makes up
+ * itself (transport errors, timeouts, aborts: no `status`; `http_<status>`
+ * for a body without a code, including one that could not be read) and for
+ * a 5xx with another code, after which the method may have run.
+ */
+export function isExplicitBitrix24Rejection(error: unknown): boolean {
+  if (!(error instanceof Bitrix24Error) || error.status === undefined) {
+    return false;
+  }
+  if (SYNTHETIC_HTTP_CODE_RE.test(error.code)) {
+    return false;
+  }
+  return error.status < 500 || RETRYABLE_CODES.has(error.code);
 }
 
 export function createBitrix24Client(options: Bitrix24ClientOptions): Bitrix24Client {
@@ -390,8 +419,11 @@ export function createBitrix24Client(options: Bitrix24ClientOptions): Bitrix24Cl
       }
 
       const error = describeEnvelopeError(method, response.status, body);
+      // A bare 429/503 proves nothing about whether the method ran; only a
+      // caller that may repeat the call (the default) retries on it.
       const retryable =
-        RETRYABLE_CODES.has(error.code) || response.status === 429 || response.status === 503;
+        RETRYABLE_CODES.has(error.code) ||
+        (retryTransport && (response.status === 429 || response.status === 503));
       if (retryable && attempt < maxRetries) {
         lastError = error;
         await sleep(backoffMs(attempt, random));

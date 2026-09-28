@@ -169,21 +169,44 @@ describe("token", () => {
   });
 });
 
-describe("HTTP status mapping", () => {
+describe("HTTP status mapping (the sidecar's code first, then the status)", () => {
+  const TOO_LARGE_TEXT = "the export is too large for one sheet; ask for one warehouse";
   it.each([
-    [401, { error: "unauthorized", detail: "bearer token required" }, "EXPORT_UNAUTHORIZED", "unauthorized"],
-    [400, { ok: false, code: "BAD_WAREHOUSE_CODE", message: "x" }, "EXPORT_BAD_REQUEST", "BAD_WAREHOUSE_CODE"],
-    [404, { ok: false, code: "WAREHOUSE_NOT_FOUND", message: "x" }, "EXPORT_NOT_FOUND", "WAREHOUSE_NOT_FOUND"],
-    [405, { ok: false, code: "METHOD_NOT_ALLOWED", message: "x" }, "EXPORT_BAD_REQUEST", "METHOD_NOT_ALLOWED"],
-    [413, { ok: false, code: "TOO_LARGE", message: "x" }, "EXPORT_TOO_LARGE", "TOO_LARGE"],
-    [500, { ok: false, code: "INTERNAL", message: "x" }, "EXPORT_UPSTREAM_ERROR", "INTERNAL"],
-    [502, { ok: false, code: "UPSTREAM_1C_ERROR", message: "x" }, "EXPORT_UPSTREAM_ERROR", "UPSTREAM_1C_ERROR"],
-    [504, { ok: false, code: "UPSTREAM_TIMEOUT", message: "x" }, "EXPORT_TIMEOUT", "UPSTREAM_TIMEOUT"],
-  ] as const)("maps HTTP %i to %s", async (status, body, code, upstream) => {
+    // By the sidecar's own code, on any status.
+    [413, { ok: false, code: "TOO_LARGE" }, "EXPORT_TOO_LARGE", "TOO_LARGE", TOO_LARGE_TEXT],
+    [400, { ok: false, code: "TOO_LARGE" }, "EXPORT_TOO_LARGE", "TOO_LARGE", TOO_LARGE_TEXT],
+    [500, { ok: false, code: "TOO_LARGE" }, "EXPORT_TOO_LARGE", "TOO_LARGE", TOO_LARGE_TEXT],
+    [404, { ok: false, code: "UNKNOWN_WAREHOUSE" }, "EXPORT_NOT_FOUND", "UNKNOWN_WAREHOUSE", "no warehouse has that code"],
+    [
+      503,
+      { ok: false, code: "NAMES_UNAVAILABLE" },
+      "EXPORT_NAMES_UNAVAILABLE",
+      "NAMES_UNAVAILABLE",
+      "item names are not loaded on the export service; ask the operator",
+    ],
+    [503, { ok: false, code: "NOT_CONFIGURED" }, "EXPORT_NOT_CONFIGURED", "NOT_CONFIGURED", "export service is not configured"],
+    // By status, when the code is unknown or missing.
+    [413, {}, "EXPORT_TOO_LARGE", undefined, TOO_LARGE_TEXT],
+    [404, { ok: false, code: "WAREHOUSE_NOT_FOUND" }, "EXPORT_UPSTREAM_ERROR", "WAREHOUSE_NOT_FOUND", "export service failed"],
+    [404, {}, "EXPORT_UPSTREAM_ERROR", undefined, "export service failed"],
+    [503, { ok: false, code: "BUSY" }, "EXPORT_UNAVAILABLE", "BUSY", "export service is unavailable right now"],
+    [503, {}, "EXPORT_UNAVAILABLE", undefined, "export service is unavailable right now"],
+    [504, { ok: false, code: "UPSTREAM_TIMEOUT" }, "EXPORT_TIMEOUT", "UPSTREAM_TIMEOUT", "export service timed out reading the data"],
+    [401, { error: "unauthorized", detail: "bearer token required" }, "EXPORT_UNAUTHORIZED", "unauthorized", "export service refused the credentials"],
+    [403, {}, "EXPORT_UNAUTHORIZED", undefined, "export service refused the credentials"],
+    [400, { ok: false, code: "BAD_WAREHOUSE_CODE" }, "EXPORT_BAD_REQUEST", "BAD_WAREHOUSE_CODE", "export service rejected the request"],
+    [405, { ok: false, code: "METHOD_NOT_ALLOWED" }, "EXPORT_BAD_REQUEST", "METHOD_NOT_ALLOWED", "export service rejected the request"],
+    [422, { detail: [] }, "EXPORT_BAD_REQUEST", undefined, "export service rejected the request"],
+    [500, { ok: false, code: "INTERNAL" }, "EXPORT_UPSTREAM_ERROR", "INTERNAL", "export service failed"],
+    [502, { ok: false, code: "UPSTREAM_1C_ERROR" }, "EXPORT_UPSTREAM_ERROR", "UPSTREAM_1C_ERROR", "export service failed"],
+    [418, {}, "EXPORT_UPSTREAM_ERROR", undefined, "export service failed"],
+  ] as const)("maps HTTP %i %j to %s", async (status, body, code, upstream, message) => {
     const { impl } = fakeFetch(() => jsonResponse(body, status));
     const error = await expectExportError(fetchStockExport({ request: {}, fetchImpl: impl, env: ENV }), code);
     expect(error.status).toBe(status);
     expect(error.upstreamCode).toBe(upstream);
+    expect(error.message).toBe(message);
+    expect(error.message).not.toMatch(/[\u2013\u2014]/);
   });
 
   it("drops an upstream code that is not a safe token", async () => {
@@ -195,9 +218,20 @@ describe("HTTP status mapping", () => {
     expect(error.upstreamCode).toBeUndefined();
   });
 
+  it("an unsafe code is not mapped by name either: the status decides", async () => {
+    const { impl } = fakeFetch(() => jsonResponse({ ok: false, code: "NAMES_UNAVAILABLE\n" }, 503));
+    const error = await expectExportError(
+      fetchStockExport({ request: {}, fetchImpl: impl, env: ENV }),
+      "EXPORT_UNAVAILABLE",
+    );
+    expect(error.upstreamCode).toBeUndefined();
+  });
+
   it("maps a non-JSON error body without failing on it", async () => {
     const { impl } = fakeFetch(() => new Response("<html>bad gateway</html>", { status: 502 }));
     await expectExportError(fetchStockExport({ request: {}, fetchImpl: impl, env: ENV }), "EXPORT_UPSTREAM_ERROR");
+    const { impl: tooLarge } = fakeFetch(() => new Response("<html>entity too large</html>", { status: 413 }));
+    await expectExportError(fetchStockExport({ request: {}, fetchImpl: tooLarge, env: ENV }), "EXPORT_TOO_LARGE");
   });
 });
 
@@ -375,15 +409,71 @@ describe("response validation", () => {
 
 describe("summary validation (exact types)", () => {
   it("accepts the contract shape", () => {
-    expect(validateStockExportSummary(summary())).toEqual(summary());
+    const counters = { items_without_name: 0, null_amounts: 0 };
+    expect(validateStockExportSummary(summary())).toEqual({ ...summary(), ...counters });
     const withWarehouse = summary({ warehouse_code: "WH-01", warehouse_name: "მთავარი საწყობი" });
-    expect(validateStockExportSummary(withWarehouse, { warehouse_code: "WH-01" })).toEqual(withWarehouse);
+    expect(validateStockExportSummary(withWarehouse, { warehouse_code: "WH-01" })).toEqual({
+      ...withWarehouse,
+      ...counters,
+    });
     // The server may normalise the case of the code.
     expect(
       validateStockExportSummary(summary({ warehouse_code: "WH-01" }), { warehouse_code: "wh-01" }).warehouse_code,
     ).toBe("WH-01");
     const truncated = summary({ rows: 20000, total_rows_available: 23000, truncated: true });
-    expect(validateStockExportSummary(truncated)).toEqual(truncated);
+    expect(validateStockExportSummary(truncated)).toEqual({ ...truncated, ...counters });
+  });
+
+  it("items_without_name and null_amounts are optional non-negative integers (0 when absent)", () => {
+    const withCounters = summary({ items_without_name: 12, null_amounts: 3 });
+    expect(validateStockExportSummary(withCounters)).toEqual(withCounters);
+    expect(validateStockExportSummary(summary({ items_without_name: 5 }))).toMatchObject({
+      items_without_name: 5,
+      null_amounts: 0,
+    });
+    expect(validateStockExportSummary(summary({ null_amounts: 0 }))).toMatchObject({
+      items_without_name: 0,
+      null_amounts: 0,
+    });
+  });
+
+  it.each([
+    ["items_without_name", -1],
+    ["items_without_name", 1.5],
+    ["items_without_name", "3"],
+    ["items_without_name", null],
+    ["items_without_name", true],
+    ["null_amounts", -2],
+    ["null_amounts", Number.NaN],
+    ["null_amounts", "0"],
+    ["null_amounts", null],
+  ])("rejects summary.%s = %j", (key, value) => {
+    expectInvalid(exportBody({}, { [key]: value }));
+  });
+
+  it("the summary date must equal the requested as_of", () => {
+    expect(validateStockExportSummary(summary(), { as_of: "2026-01-15" }).as_of).toBe("2026-01-15");
+    let caught: unknown;
+    try {
+      validateStockExportSummary(summary(), { as_of: "2025-12-31" });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(SheetExportError);
+    expect((caught as SheetExportError).code).toBe("EXPORT_INVALID_RESPONSE");
+    expect((caught as SheetExportError).message).toBe(
+      "export response rejected: summary date does not match the request",
+    );
+    // Without an as_of in the request, the server's date (today) is accepted.
+    expect(validateStockExportSummary(summary({ as_of: "2026-09-28" })).as_of).toBe("2026-09-28");
+  });
+
+  it("fetchStockExport refuses a file for another date than requested", async () => {
+    const { impl } = fakeFetch(() => jsonResponse(exportBody({}, { as_of: "2026-01-15" })));
+    await expectExportError(
+      fetchStockExport({ request: { as_of: "2026-01-14" }, fetchImpl: impl, env: ENV }),
+      "EXPORT_INVALID_RESPONSE",
+    );
   });
 
   it.each([

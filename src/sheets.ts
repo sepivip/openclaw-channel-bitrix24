@@ -67,6 +67,10 @@ export type StockExportSummary = {
   row_cap: number;
   byte_cap: number;
   source: string;
+  /** Lines without an item name. Optional on the wire; 0 when absent. */
+  items_without_name: number;
+  /** Lines whose amount was null upstream. Optional on the wire; 0 when absent. */
+  null_amounts: number;
 };
 
 export type StockExport = {
@@ -86,6 +90,8 @@ export type SheetExportErrorCode =
   | "EXPORT_BAD_REQUEST"
   | "EXPORT_NOT_FOUND"
   | "EXPORT_TOO_LARGE"
+  | "EXPORT_NAMES_UNAVAILABLE"
+  | "EXPORT_UNAVAILABLE"
   | "EXPORT_TIMEOUT"
   | "EXPORT_UNREACHABLE"
   | "EXPORT_UPSTREAM_ERROR"
@@ -182,7 +188,9 @@ function hasZipSignature(bytes: Uint8Array): boolean {
 
 /**
  * Validate the summary object exactly. `request` is used for consistency
- * checks: the file must be for the warehouse the tool asked for.
+ * checks: the file must be for the warehouse and the date the tool asked for.
+ * `items_without_name` and `null_amounts` are optional (an older export
+ * service does not send them) and default to 0.
  */
 export function validateStockExportSummary(
   raw: unknown,
@@ -207,6 +215,11 @@ export function validateStockExportSummary(
   }
   for (const key of ["rows", "total_rows_available", "row_cap", "byte_cap"] as const) {
     if (!isNonNegativeInt(raw[key])) {
+      throw invalidResponse(`summary.${key} is not a non-negative integer`);
+    }
+  }
+  for (const key of ["items_without_name", "null_amounts"] as const) {
+    if (raw[key] !== undefined && !isNonNegativeInt(raw[key])) {
       throw invalidResponse(`summary.${key} is not a non-negative integer`);
     }
   }
@@ -238,6 +251,9 @@ export function validateStockExportSummary(
   } else if (typeof code !== "string" || code.toUpperCase() !== requestedCode.toUpperCase()) {
     throw invalidResponse("summary warehouse does not match the request");
   }
+  if (request.as_of !== undefined && raw.as_of !== request.as_of) {
+    throw invalidResponse("summary date does not match the request");
+  }
   return {
     kind: "stock",
     as_of: raw.as_of,
@@ -251,6 +267,8 @@ export function validateStockExportSummary(
     row_cap: raw.row_cap as number,
     byte_cap: raw.byte_cap as number,
     source: raw.source,
+    items_without_name: (raw.items_without_name as number | undefined) ?? 0,
+    null_amounts: (raw.null_amounts as number | undefined) ?? 0,
   };
 }
 
@@ -371,23 +389,46 @@ async function readUpstreamCode(response: Response): Promise<string | undefined>
   }
 }
 
+/**
+ * Map a non-200 export response. The sidecar's own `code` decides first (on
+ * any status), then the HTTP status. `upstreamCode` has already passed the
+ * safe-token pattern; an unsafe code counts as no code.
+ */
 function errorForStatus(status: number, upstreamCode: string | undefined): SheetExportError {
   const extra = { status, ...(upstreamCode ? { upstreamCode } : {}) };
+  const tooLarge = "the export is too large for one sheet; ask for one warehouse";
+  switch (upstreamCode) {
+    case "TOO_LARGE":
+      return new SheetExportError("EXPORT_TOO_LARGE", tooLarge, extra);
+    case "UNKNOWN_WAREHOUSE":
+      return new SheetExportError("EXPORT_NOT_FOUND", "no warehouse has that code", extra);
+    case "NAMES_UNAVAILABLE":
+      return new SheetExportError(
+        "EXPORT_NAMES_UNAVAILABLE",
+        "item names are not loaded on the export service; ask the operator",
+        extra,
+      );
+    case "NOT_CONFIGURED":
+      return new SheetExportError("EXPORT_NOT_CONFIGURED", "export service is not configured", extra);
+    default:
+      break;
+  }
+  if (status === 413) {
+    return new SheetExportError("EXPORT_TOO_LARGE", tooLarge, extra);
+  }
+  if (status === 503) {
+    return new SheetExportError("EXPORT_UNAVAILABLE", "export service is unavailable right now", extra);
+  }
+  if (status === 504) {
+    return new SheetExportError("EXPORT_TIMEOUT", "export service timed out reading the data", extra);
+  }
   if (status === 401 || status === 403) {
     return new SheetExportError("EXPORT_UNAUTHORIZED", "export service refused the credentials", extra);
   }
   if (status === 400 || status === 405 || status === 422) {
     return new SheetExportError("EXPORT_BAD_REQUEST", "export service rejected the request", extra);
   }
-  if (status === 404) {
-    return new SheetExportError("EXPORT_NOT_FOUND", "export service found nothing for this request", extra);
-  }
-  if (status === 413) {
-    return new SheetExportError("EXPORT_TOO_LARGE", "export is larger than the service allows", extra);
-  }
-  if (status === 504) {
-    return new SheetExportError("EXPORT_TIMEOUT", "export service timed out reading the data", extra);
-  }
+  // Includes a 404 with any other code, or none: not a known missing warehouse.
   return new SheetExportError("EXPORT_UPSTREAM_ERROR", "export service failed", extra);
 }
 

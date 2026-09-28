@@ -235,9 +235,10 @@ export type Bitrix24SendFileResult = {
  * `botToken`, `dialogId`, and `fields.{name, content, message}`. Response:
  * `{ file: { id, ... }, messageId, chatId, dialogId }`.
  *
- * A timeout or transport error is NOT retried (the upload may already have
- * happened); it surfaces as a `Bitrix24Error`. A response without a file id
- * and without a message id is treated as a failure, never as a success.
+ * A timeout, a transport error or a bare 429/503 is NOT retried (the upload
+ * may already have happened); it surfaces as a `Bitrix24Error`. Success needs
+ * a real message id (a positive integer): a file id alone, or a message id of
+ * 0, null or "", is `UPLOAD_UNCONFIRMED`, never a success.
  */
 export async function sendFile(params: Bitrix24SendFileParams): Promise<Bitrix24SendFileResult> {
   const caption = typeof params.caption === "string" ? escapeBbCode(stripMarks(params.caption)) : "";
@@ -260,11 +261,11 @@ export async function sendFile(params: Bitrix24SendFileParams): Promise<Bitrix24
     },
   );
   const extracted = extractFileUploadResult(result);
-  if (!extracted.fileId && !extracted.messageId) {
+  if (!extracted.messageId) {
     throw new Bitrix24Error({
       method: "imbot.v2.File.upload",
       code: "UPLOAD_UNCONFIRMED",
-      description: "imbot.v2.File.upload returned neither a file id nor a message id.",
+      description: "imbot.v2.File.upload returned no message id.",
     });
   }
   return extracted;
@@ -280,7 +281,21 @@ function idOrEmpty(value: unknown): string {
   return "";
 }
 
-/** `{ file: { id }, messageId }` per apidocs; `fileId` / `message.id` tolerated. */
+/** A positive integer id (number > 0, or digits that are not all zeros), else "". */
+function positiveIdOrEmpty(value: unknown): string {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) {
+    return String(value);
+  }
+  if (typeof value === "string" && /^\d{1,20}$/.test(value.trim()) && /[1-9]/.test(value)) {
+    return value.trim();
+  }
+  return "";
+}
+
+/**
+ * `{ file: { id }, messageId }` per apidocs; `fileId` / `message.id` tolerated.
+ * `messageId` is "" unless it is a positive integer.
+ */
 export function extractFileUploadResult(result: unknown): Bitrix24SendFileResult {
   const record = (result && typeof result === "object" ? result : {}) as {
     file?: { id?: unknown };
@@ -290,7 +305,7 @@ export function extractFileUploadResult(result: unknown): Bitrix24SendFileResult
   };
   return {
     fileId: idOrEmpty(record.file?.id ?? record.fileId),
-    messageId: idOrEmpty(record.messageId ?? record.message?.id),
+    messageId: positiveIdOrEmpty(record.messageId ?? record.message?.id),
   };
 }
 

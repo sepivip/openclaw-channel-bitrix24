@@ -43,7 +43,7 @@ vi.mock("openclaw/plugin-sdk/channel-inbound", async (importOriginal) => {
   };
 });
 
-import type { Bitrix24Client } from "../src/client.js";
+import { createBitrix24Client, type Bitrix24Client } from "../src/client.js";
 import { resetBitrix24ConfigNotices } from "../src/config-schema.js";
 import { handleBitrix24InboundEvent, type Bitrix24RawEvent } from "../src/inbound.js";
 import { Bitrix24Error } from "../src/secrets.js";
@@ -126,6 +126,8 @@ type SetupOptions = {
   rawContext?: OpenClawPluginToolContext;
   exportResponse?: () => Response | Promise<Response>;
   upload?: (params: Record<string, unknown>) => unknown;
+  /** Replace the recording fake with another client (e.g. the real one over a stub fetch). */
+  client?: Bitrix24Client;
   running?: boolean;
   env?: NodeJS.ProcessEnv;
 };
@@ -133,7 +135,7 @@ type SetupOptions = {
 function setup(opts: SetupOptions = {}) {
   const cfg = opts.cfg ?? buildConfig();
   const uploads: UploadCall[] = [];
-  const client: Bitrix24Client = {
+  const client: Bitrix24Client = opts.client ?? {
     call: (async (method: string, params?: Record<string, unknown>, options?: unknown) => {
       uploads.push({ method, params: params ?? {}, options });
       return opts.upload ? opts.upload(params ?? {}) : { file: { id: 138 }, messageId: 777, dialogId: params?.dialogId };
@@ -166,8 +168,21 @@ function setup(opts: SetupOptions = {}) {
     uploads,
     fetchImpl,
     log,
-    run: (args: unknown = { kind: "stock" }) => runBitrix24SendSheet(deps, args),
+    run: (args: unknown = { kind: "stock" }, signal?: AbortSignal) => runBitrix24SendSheet(deps, args, signal),
   };
+}
+
+/** The real client over a stub Bitrix fetch: exercises the true retry and error paths. */
+function realClient(bitrixFetch: (init: RequestInit) => Response | Promise<Response>) {
+  const spy = vi.fn(async (_url: unknown, init?: RequestInit) => await bitrixFetch(init ?? {}));
+  const client = createBitrix24Client({
+    baseUrl: "https://synthetic.bitrix24.test/rest/7/fakefakefake/",
+    portalDomains: ["bitrix24.test"],
+    fetchImpl: spy as unknown as typeof fetch,
+    sleep: async () => {},
+    random: () => 0.5,
+  });
+  return { client, spy };
 }
 
 function expectRefused(result: SendSheetResult, code: string) {
@@ -217,6 +232,16 @@ describe("tool schema", () => {
     const result = await tool.execute("call-1", { kind: "stock" });
     expect(result.details).toMatchObject({ ok: true });
     expect(result.content).toEqual([{ type: "text", text: JSON.stringify(result.details) }]);
+  });
+
+  it("the description tells the model when a file counts as sent and what to do on each failure", () => {
+    const { description } = createBitrix24SendSheetTool(setup().deps);
+    expect(description).toContain("only when the result has ok: true");
+    expect(description).toContain("If error_code is UPLOAD_UNCONFIRMED, do not call this tool again");
+    expect(description).toContain("may already be in the chat");
+    expect(description).toContain("If error_code is EXPORT_TOO_LARGE, do not retry");
+    expect(description).toContain("one warehouse");
+    expect(description).not.toMatch(/[\u2013\u2014]/);
   });
 });
 
@@ -276,6 +301,8 @@ describe("happy path", () => {
       warehouse_code: null,
       warehouse_name: null,
       truncated: false,
+      items_without_name: 0,
+      null_amounts: 0,
       message_id: "777",
     });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
@@ -349,6 +376,64 @@ describe("turn context gates (F16)", () => {
     const { run, uploads, fetchImpl } = setup({ context: context as Partial<OpenClawPluginToolContext> });
     expectRefused(await run(), "NOT_A_BITRIX_TURN");
     expect(fetchImpl).not.toHaveBeenCalled();
+    expect(uploads).toHaveLength(0);
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["empty", ""],
+    ["blank", "   "],
+  ])("refuses a DM turn whose requesting sender is %s, 0 exports, 0 uploads", async (_label, sender) => {
+    const { run, uploads, fetchImpl, log } = setup({ context: { requesterSenderId: sender } });
+    const result = await run();
+    expectRefused(result, "NOT_A_BITRIX_TURN");
+    expect(result).toMatchObject({ message: "no requesting Bitrix24 user on this turn" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(uploads).toHaveLength(0);
+    expect(log.warn).toHaveBeenCalledWith("[bitrix24] sheet not sent code=NOT_A_BITRIX_TURN");
+  });
+
+  it("refuses an operator /tools/invoke call that only names a bitrix24 chat (no sender)", async () => {
+    // What core builds from `x-openclaw-message-channel: bitrix24` +
+    // `x-openclaw-message-to: chat<N>`: a delivery route, but nobody asking.
+    const cfg = buildConfig();
+    const { run, uploads, fetchImpl } = setup({
+      rawContext: {
+        agentId: AGENT_ID,
+        sessionKey: `agent:${AGENT_ID}:main`,
+        deliveryContext: { channel: "bitrix24", to: LISTED_GROUP },
+        getRuntimeConfig: () => cfg,
+      },
+    });
+    expectRefused(await run(), "NOT_A_BITRIX_TURN");
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(uploads).toHaveLength(0);
+  });
+
+  it("refuses a cron or subagent run that carries a bitrix24 deliveryContext but no sender", async () => {
+    const cfg = buildConfig();
+    const { run, uploads, fetchImpl } = setup({
+      rawContext: {
+        agentId: AGENT_ID,
+        sessionKey: `agent:${AGENT_ID}:cron:nightly-stock`,
+        agentAccountId: "default",
+        deliveryContext: { channel: "bitrix24", to: DM, accountId: "default" },
+        getRuntimeConfig: () => cfg,
+      },
+    });
+    expectRefused(await run(), "NOT_A_BITRIX_TURN");
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(uploads).toHaveLength(0);
+  });
+
+  it("refuses a non-numeric sender id", async () => {
+    const { run, uploads } = setup({
+      context: {
+        deliveryContext: { channel: "bitrix24", to: LISTED_GROUP, accountId: "default" },
+        requesterSenderId: "operator",
+      },
+    });
+    expectRefused(await run(), "SENDER_NOT_ALLOWED");
     expect(uploads).toHaveLength(0);
   });
 
@@ -552,20 +637,45 @@ describe("export token", () => {
   });
 });
 
-describe("failures never claim success (F15)", () => {
+const UNCONFIRMED_MESSAGE =
+  "the upload may already be in the chat; it could not be confirmed. " +
+  "Ask the user to check the chat and do not send it again";
+
+function uploadError(code: string, status?: number): Bitrix24Error {
+  return new Bitrix24Error({
+    method: "imbot.v2.File.upload",
+    code,
+    description: "synthetic",
+    ...(status === undefined ? {} : { status }),
+  });
+}
+
+function expectUnconfirmed(result: SendSheetResult, log: ReturnType<typeof captureLog>) {
+  expectRefused(result, "UPLOAD_UNCONFIRMED");
+  expect((result as { message: string }).message).toBe(UNCONFIRMED_MESSAGE);
+  expect(log.info).not.toHaveBeenCalled();
+  expect(log.warn).toHaveBeenCalledTimes(1);
+  expect(log.warn).toHaveBeenCalledWith("[bitrix24] sheet unconfirmed code=UPLOAD_UNCONFIRMED");
+  expect(JSON.stringify(result)).not.toMatch(/"ok":true|sheet sent|not sent/);
+}
+
+describe("upload outcome: refused vs unconfirmed (F15)", () => {
   it.each([
-    ["FILE_UPLOAD_FAILED", "FILE_UPLOAD_FAILED"],
-    ["FILE_TOO_LARGE", "FILE_TOO_LARGE"],
-    ["TRANSPORT_ERROR", "not confirmed"],
-  ])("an upload failure (%s) is ok:false with one warning and no success line", async (code, text) => {
+    ["FILE_TOO_LARGE on HTTP 400", "FILE_TOO_LARGE", 400],
+    ["ACCESS_DENIED on HTTP 403", "ACCESS_DENIED", 403],
+    ["an error envelope on HTTP 200", "FILE_UPLOAD_FAILED", 200],
+    ["QUERY_LIMIT_EXCEEDED on HTTP 503 (blocked before it ran)", "QUERY_LIMIT_EXCEEDED", 503],
+  ])("an explicit Bitrix rejection (%s) is UPLOAD_FAILED: not sent", async (_label, code, status) => {
     const { run, uploads, log } = setup({
       upload: () => {
-        throw new Bitrix24Error({ method: "imbot.v2.File.upload", code, description: "synthetic" });
+        throw uploadError(code, status);
       },
     });
     const result = await run();
     expectRefused(result, "UPLOAD_FAILED");
-    expect((result as { message: string }).message).toContain(text);
+    expect((result as { message: string }).message).toBe(
+      `Bitrix24 refused the upload (${code}); the file was not sent`,
+    );
     expect(uploads).toHaveLength(1);
     expect(log.info).not.toHaveBeenCalled();
     expect(log.warn).toHaveBeenCalledTimes(1);
@@ -574,25 +684,244 @@ describe("failures never claim success (F15)", () => {
     expectCleanLogs(log, [...consoleLines, JSON.stringify(result)]);
   });
 
-  it("an unconfirmed upload (no file id, no message id) is a failure", async () => {
-    const { run } = setup({ upload: () => ({}) });
-    expectRefused(await run(), "UPLOAD_FAILED");
+  it("an explicit rejection with an unsafe code is reported as UNKNOWN", async () => {
+    const { run } = setup({
+      upload: () => {
+        throw uploadError("BAD CODE <x>", 400);
+      },
+    });
+    expect(await run()).toMatchObject({
+      error_code: "UPLOAD_FAILED",
+      message: "Bitrix24 refused the upload (UNKNOWN); the file was not sent",
+    });
   });
 
   it.each([
-    [500, "EXPORT_UPSTREAM_ERROR"],
-    [504, "EXPORT_TIMEOUT"],
-    [401, "EXPORT_UNAUTHORIZED"],
-    [404, "EXPORT_NOT_FOUND"],
-  ])("an export failure (HTTP %i) is %s and nothing is uploaded", async (status, code) => {
+    ["a transport error", uploadError("TRANSPORT_ERROR")],
+    ["an abort during the upload", uploadError("ABORTED")],
+    ["HTTP 503 without a Bitrix code", uploadError("http_503", 503)],
+    ["HTTP 429 without a Bitrix code", uploadError("http_429", 429)],
+    ["HTTP 500 without a Bitrix code", uploadError("http_500", 500)],
+    ["HTTP 502 with an unreadable body", uploadError("http_502", 502)],
+    ["HTTP 400 with an unreadable body", uploadError("http_400", 400)],
+    ["HTTP 500 with a code (the method may have run)", uploadError("INTERNAL_SERVER_ERROR", 500)],
+    ["no message id from sendFile", uploadError("UPLOAD_UNCONFIRMED")],
+    ["retries given up", uploadError("RETRIES_EXHAUSTED")],
+    ["a non-Bitrix exception", new Error(`boom ${BOT_TOKEN}`)],
+  ])("%s is UPLOAD_UNCONFIRMED: it may be in the chat", async (_label, error) => {
     const { run, uploads, log } = setup({
-      exportResponse: () => jsonResponse({ ok: false, code: "SYNTHETIC", message: "x" }, status),
+      upload: () => {
+        throw error;
+      },
+    });
+    const result = await run();
+    expectUnconfirmed(result, log);
+    expect(uploads).toHaveLength(1);
+    expectCleanLogs(log, [...consoleLines, JSON.stringify(result)]);
+  });
+
+  it.each([
+    ["a file id only", { file: { id: 138 } }],
+    ["messageId 0", { file: { id: 138 }, messageId: 0 }],
+    ["messageId null", { file: { id: 138 }, messageId: null }],
+    ["messageId \"\"", { file: { id: 138 }, messageId: "" }],
+    ["messageId \"0\"", { file: { id: 138 }, messageId: "0" }],
+    ["an empty object", {}],
+    ["true", true],
+  ])("a response with %s is UPLOAD_UNCONFIRMED, never a success", async (_label, response) => {
+    const { run, log } = setup({ upload: () => response });
+    expectUnconfirmed(await run(), log);
+  });
+});
+
+describe("upload outcome through the real client (no retry of a maybe-posted upload)", () => {
+  const encoder = new TextEncoder();
+
+  it("a transport error is UPLOAD_UNCONFIRMED after exactly one request", async () => {
+    const { client, spy } = realClient(() => {
+      throw new TypeError("fetch failed");
+    });
+    const { run, log } = setup({ client });
+    expectUnconfirmed(await run(), log);
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it("a timeout before the response is UPLOAD_UNCONFIRMED after exactly one request", async () => {
+    const { client, spy } = realClient(() => {
+      throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    });
+    const { run, log } = setup({ client });
+    expectUnconfirmed(await run(), log);
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it("a timeout while reading a 200 body is UPLOAD_UNCONFIRMED", async () => {
+    const { client, spy } = realClient(
+      () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(encoder.encode('{"result":{"file":{"id":138},'));
+              controller.error(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+            },
+          }),
+          { status: 200 },
+        ),
+    );
+    const { run, log } = setup({ client });
+    expectUnconfirmed(await run(), log);
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    [503, "<html>Service Unavailable</html>"],
+    [429, "<html>Too Many Requests</html>"],
+    [500, "{}"],
+    [502, "not json"],
+  ])("a bare HTTP %i is UPLOAD_UNCONFIRMED and is not retried", async (status, body) => {
+    const { client, spy } = realClient(() => new Response(body, { status }));
+    const { run, log } = setup({ client });
+    expectUnconfirmed(await run(), log);
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it("an explicit FILE_TOO_LARGE body is UPLOAD_FAILED", async () => {
+    const { client, spy } = realClient(() =>
+      jsonResponse({ error: "FILE_TOO_LARGE", error_description: "too big" }, 400),
+    );
+    const { run } = setup({ client });
+    expect(await run()).toMatchObject({
+      ok: false,
+      error_code: "UPLOAD_FAILED",
+      message: "Bitrix24 refused the upload (FILE_TOO_LARGE); the file was not sent",
+    });
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it("QUERY_LIMIT_EXCEEDED is retried (rejected before it ran), then the upload succeeds once", async () => {
+    let calls = 0;
+    const { client, spy } = realClient(() => {
+      calls += 1;
+      return calls === 1
+        ? jsonResponse({ error: "QUERY_LIMIT_EXCEEDED", error_description: "too fast" }, 503)
+        : jsonResponse({ result: { file: { id: 138 }, messageId: 778 } });
+    });
+    const { run } = setup({ client });
+    expect(await run()).toMatchObject({ ok: true, message_id: "778" });
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  it("a 200 with a file id and messageId 0 is UPLOAD_UNCONFIRMED", async () => {
+    const { client } = realClient(() => jsonResponse({ result: { file: { id: 138 }, messageId: 0 } }));
+    const { run, log } = setup({ client });
+    expectUnconfirmed(await run(), log);
+  });
+
+  it("an abort after the upload request started is UPLOAD_UNCONFIRMED, not ABORTED", async () => {
+    const controller = new AbortController();
+    const { client, spy } = realClient(
+      (init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+          controller.abort();
+        }),
+    );
+    const { run, log } = setup({ client });
+    expectUnconfirmed(await run({ kind: "stock" }, controller.signal), log);
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it("an abort while reading the 200 body is UPLOAD_UNCONFIRMED, not ABORTED", async () => {
+    const controller = new AbortController();
+    const { client } = realClient(
+      () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(stream) {
+              controller.abort();
+              stream.error(controller.signal.reason);
+            },
+          }),
+          { status: 200 },
+        ),
+    );
+    const { run, log } = setup({ client });
+    expectUnconfirmed(await run({ kind: "stock" }, controller.signal), log);
+  });
+
+  it("an abort before the upload starts is ABORTED and nothing is uploaded", async () => {
+    const controller = new AbortController();
+    const { client, spy } = realClient(() => jsonResponse({ result: { file: { id: 138 }, messageId: 779 } }));
+    const { run, fetchImpl, log } = setup({
+      client,
+      exportResponse: () => {
+        // The export answers, then the turn is cancelled before the upload.
+        controller.abort();
+        return jsonResponse(exportBody());
+      },
+    });
+    const result = await run({ kind: "stock" }, controller.signal);
+    expectRefused(result, "ABORTED");
+    expect(result).toMatchObject({ message: "the request was cancelled; nothing was uploaded" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(spy).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledWith("[bitrix24] sheet not sent code=ABORTED");
+  });
+
+  it("an already cancelled turn is ABORTED before the export", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { client, spy } = realClient(() => jsonResponse({ result: { messageId: 1 } }));
+    const { run, fetchImpl } = setup({ client });
+    expectRefused(await run({ kind: "stock" }, controller.signal), "ABORTED");
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(spy).not.toHaveBeenCalled();
+  });
+});
+
+describe("export failures never claim success", () => {
+  it.each([
+    [500, "SYNTHETIC", "EXPORT_UPSTREAM_ERROR"],
+    [504, "SYNTHETIC", "EXPORT_TIMEOUT"],
+    [401, "SYNTHETIC", "EXPORT_UNAUTHORIZED"],
+    [404, "SYNTHETIC", "EXPORT_UPSTREAM_ERROR"],
+    [404, "UNKNOWN_WAREHOUSE", "EXPORT_NOT_FOUND"],
+    [413, "TOO_LARGE", "EXPORT_TOO_LARGE"],
+    [503, "NAMES_UNAVAILABLE", "EXPORT_NAMES_UNAVAILABLE"],
+    [503, "NOT_CONFIGURED", "EXPORT_NOT_CONFIGURED"],
+    [503, "SYNTHETIC", "EXPORT_UNAVAILABLE"],
+  ])("an export failure (HTTP %i, %s) is %s and nothing is uploaded", async (status, upstream, code) => {
+    const { run, uploads, log } = setup({
+      exportResponse: () => jsonResponse({ ok: false, code: upstream, message: "x" }, status),
     });
     const result = await run();
     expectRefused(result, code);
-    expect((result as { message: string }).message).toContain("not sent");
+    expect((result as { message: string }).message).toContain(`(${upstream}); the file was not sent`);
     expect(uploads).toHaveLength(0);
     expect(log.warn).toHaveBeenCalledWith(`[bitrix24] sheet not sent code=${code}`);
+  });
+
+  it("the model is told how to recover from the known export failures", async () => {
+    const cases = [
+      [413, "TOO_LARGE", "the export is too large for one sheet; ask for one warehouse"],
+      [404, "UNKNOWN_WAREHOUSE", "no warehouse has that code"],
+      [503, "NAMES_UNAVAILABLE", "item names are not loaded on the export service; ask the operator"],
+      [503, "NOT_CONFIGURED", "export service is not configured"],
+    ] as const;
+    for (const [status, upstream, text] of cases) {
+      const { run } = setup({ exportResponse: () => jsonResponse({ ok: false, code: upstream }, status) });
+      expect((await run()) as { message: string }).toMatchObject({
+        message: `${text} (${upstream}); the file was not sent`,
+      });
+    }
+  });
+
+  it("a summary for another date than the one requested is refused and nothing is uploaded", async () => {
+    const { run, uploads } = setup({ exportResponse: () => jsonResponse(exportBody({ as_of: "2026-01-15" })) });
+    const result = await run({ kind: "stock", as_of: "2025-12-31" });
+    expectRefused(result, "EXPORT_INVALID_RESPONSE");
+    expect(result).toMatchObject({ message: expect.stringContaining("summary date does not match the request") });
+    expect(uploads).toHaveLength(0);
   });
 
   it("an invalid export response is refused and nothing is uploaded", async () => {
@@ -676,6 +1005,58 @@ describe("caption and result carry the server numbers exactly (F20)", () => {
     expect(buildStockSheetCaption(codeOnly as never, "ka")).toContain("ნაშთი საწყობში WH-02,");
   });
 
+  it("lines without an item name add one sentence to the caption, in both languages", () => {
+    const unnamed = summary({ items_without_name: 3, null_amounts: 2 });
+    expect(buildStockSheetCaption(unnamed as never, "en")).toBe(
+      "Stock across all warehouses as of 2026-01-15: 2700 lines, total quantity 12345.678. Source: 1C copy. " +
+        "3 lines have no item name.",
+    );
+    expect(buildStockSheetCaption(unnamed as never, "ka")).toBe(
+      "ნაშთი ყველა საწყობში, 2026-01-15-ის მდგომარეობით: 2700 სტრიქონი, ჯამური რაოდენობა 12345.678. " +
+        "წყარო: 1C-ის ასლი. 3 სტრიქონს არ აქვს საქონლის დასახელება.",
+    );
+    const one = summary({ items_without_name: 1 });
+    expect(buildStockSheetCaption(one as never, "en")).toMatch(/ 1 line has no item name\.$/);
+    expect(buildStockSheetCaption(one as never, "ka")).toMatch(/ 1 სტრიქონს არ აქვს საქონლის დასახელება\.$/);
+    // After the truncation sentence, when both apply.
+    const both = summary({ rows: 10, total_rows_available: 12, truncated: true, items_without_name: 2 });
+    expect(buildStockSheetCaption(both as never, "en")).toMatch(
+      /Total quantity of all lines: 12345\.678\. 2 lines have no item name\.$/,
+    );
+    for (const lang of ["en", "ka"] as const) {
+      expect(buildStockSheetCaption(unnamed as never, lang)).not.toMatch(/[\u2013\u2014]/);
+      // null_amounts is reported to the model only, never in the caption.
+      expect(buildStockSheetCaption(summary({ null_amounts: 5 }) as never, lang)).toBe(
+        buildStockSheetCaption(summary() as never, lang),
+      );
+    }
+  });
+
+  it("no item-name sentence when every line has a name", () => {
+    for (const lang of ["en", "ka"] as const) {
+      const caption = buildStockSheetCaption(summary({ items_without_name: 0 }) as never, lang);
+      expect(caption).not.toMatch(/no item name|დასახელება/);
+    }
+  });
+
+  it("the result carries items_without_name and null_amounts, and the caption the sentence", async () => {
+    const { run, uploads } = setup({
+      exportResponse: () => jsonResponse(exportBody({ items_without_name: 4, null_amounts: 7 })),
+    });
+    const result = await run({ kind: "stock", lang: "ka" });
+    expect(result).toMatchObject({ ok: true, items_without_name: 4, null_amounts: 7 });
+    const caption = (uploads[0]?.params.fields as { message: string }).message;
+    expect(caption).toMatch(/ 4 სტრიქონს არ აქვს საქონლის დასახელება\.$/);
+  });
+
+  it("an older export service without the new fields still works (both 0)", async () => {
+    const legacy = summary();
+    expect(legacy).not.toHaveProperty("items_without_name");
+    expect(legacy).not.toHaveProperty("null_amounts");
+    const { run } = setup({ exportResponse: () => jsonResponse(exportBody()) });
+    expect(await run()).toMatchObject({ ok: true, items_without_name: 0, null_amounts: 0 });
+  });
+
   it("the caption is built from the server summary only, with brackets escaped", async () => {
     const { run, uploads } = setup({
       exportResponse: () =>
@@ -701,6 +1082,12 @@ describe("log hygiene", () => {
         },
       },
       { context: { agentId: "main" } },
+      { context: { requesterSenderId: undefined } },
+      {
+        client: realClient(() => {
+          throw new TypeError("fetch failed: https://synthetic.bitrix24.test/rest/7/fakefakefake/imbot.v2.File.upload");
+        }).client,
+      },
     ];
     for (const scenario of scenarios) {
       const { run, log } = setup(scenario);
@@ -751,6 +1138,25 @@ describe("registration", () => {
     expect(manifest.toolMetadata).toEqual({
       [BITRIX24_SEND_SHEET_TOOL_NAME]: { optional: true, sideEffecting: true },
     });
+  });
+
+  it("a factory-built tool refuses a bitrix24 route without a requesting user (operator invoke)", async () => {
+    const entry = (await import("../src/index.js")).default as unknown as { register: (api: unknown) => void };
+    const registerTool = vi.fn();
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    entry.register({ registrationMode: "tool-discovery", registerTool, logger });
+    const factory = registerTool.mock.calls[0]?.[0] as (ctx: unknown) => {
+      execute: (id: string, params: unknown) => Promise<{ details: SendSheetResult }>;
+    };
+    const tool = factory({
+      agentId: AGENT_ID,
+      deliveryContext: { channel: "bitrix24", to: LISTED_GROUP },
+      getRuntimeConfig: () => buildConfig(),
+    });
+    const result = await tool.execute("call-1", { kind: "stock" });
+    expectRefused(result.details, "NOT_A_BITRIX_TURN");
+    expect(result.details).toMatchObject({ message: "no requesting Bitrix24 user on this turn" });
+    expect(logger.warn).toHaveBeenCalledWith("[bitrix24] sheet not sent code=NOT_A_BITRIX_TURN");
   });
 
   it("a factory-built tool refuses outside a Bitrix turn and uploads nothing", async () => {

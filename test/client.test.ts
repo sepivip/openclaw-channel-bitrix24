@@ -3,6 +3,7 @@ import {
   BITRIX24_METHOD_ALLOWLIST,
   assertAllowedBitrix24Method,
   createBitrix24Client,
+  isExplicitBitrix24Rejection,
   validateBitrix24BaseUrl,
 } from "../src/client.js";
 import { Bitrix24ConfigError, Bitrix24Error } from "../src/secrets.js";
@@ -339,6 +340,75 @@ describe("client call path", () => {
     expect(calls).toBe(2);
   });
 
+  it.each([
+    [503, "<html>Service Unavailable</html>"],
+    [429, "<html>Too Many Requests</html>"],
+    [503, JSON.stringify({ error: "INTERNAL_SERVER_ERROR", error_description: "x" })],
+    [429, "{}"],
+  ])("does not retry HTTP %i without a rate-limit code when transport retries are off (%s)", async (status, body) => {
+    const fetchImpl = vi.fn(async () => new Response(body, { status }));
+    const sleeps: number[] = [];
+    const client = createBitrix24Client({
+      baseUrl: GOOD_URL,
+      portalDomains: PORTAL_DOMAINS,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+      random: () => 0.5,
+    });
+    let thrown: unknown;
+    try {
+      await client.call("imbot.v2.File.upload", {}, { retryTransportErrors: false });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Bitrix24Error);
+    expect((thrown as Bitrix24Error).status).toBe(status);
+    // The first request may have been processed behind a proxy: never send it twice.
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  it.each([
+    ["QUERY_LIMIT_EXCEEDED", 503],
+    ["OPERATION_TIME_LIMIT", 429],
+    ["QUERY_LIMIT_EXCEEDED", 200],
+  ])("retries an explicit %s (HTTP %i) when transport retries are off, then gives up", async (code, status) => {
+    const fetchImpl = vi.fn(
+      async () => new Response(JSON.stringify({ error: code, error_description: "limit" }), { status }),
+    );
+    const client = createBitrix24Client({
+      baseUrl: GOOD_URL,
+      portalDomains: PORTAL_DOMAINS,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      maxRetries: 2,
+      sleep: async () => {},
+      random: () => 0.5,
+    });
+    await expect(
+      client.call("imbot.v2.File.upload", {}, { retryTransportErrors: false }),
+    ).rejects.toMatchObject({ code });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([503, 429])("keeps retrying a bare HTTP %i by default (other callers unchanged)", async (status) => {
+    const fetchImpl = vi.fn(async () => new Response("<html>busy</html>", { status }));
+    const client = createBitrix24Client({
+      baseUrl: GOOD_URL,
+      portalDomains: PORTAL_DOMAINS,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      maxRetries: 2,
+      sleep: async () => {},
+      random: () => 0.5,
+    });
+    await expect(client.call("imbot.v2.Chat.Message.send", {})).rejects.toMatchObject({
+      code: `http_${status}`,
+      status,
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
   it("describe() exposes only host and webhook user id", () => {
     const client = createBitrix24Client({
       baseUrl: GOOD_URL,
@@ -346,5 +416,53 @@ describe("client call path", () => {
       fetchImpl: forbiddenFetch(),
     });
     expect(client.describe()).toEqual({ host: "acme.example.bitrix24.eu", userId: "42" });
+  });
+});
+
+describe("isExplicitBitrix24Rejection", () => {
+  const error = (code: string, status?: number) =>
+    new Bitrix24Error({ method: "imbot.v2.File.upload", code, description: "x", ...(status === undefined ? {} : { status }) });
+
+  it.each([
+    ["an error envelope on 200", error("FILE_UPLOAD_FAILED", 200)],
+    ["a 400 with a code", error("FILE_TOO_LARGE", 400)],
+    ["a 401 with a code", error("expired_token", 401)],
+    ["a 403 with a code", error("ACCESS_DENIED", 403)],
+    ["a 429 with a code", error("TOO_MANY_REQUESTS", 429)],
+    ["QUERY_LIMIT_EXCEEDED on 503", error("QUERY_LIMIT_EXCEEDED", 503)],
+    ["OPERATION_TIME_LIMIT on 503", error("OPERATION_TIME_LIMIT", 503)],
+  ])("true for %s", (_label, value) => {
+    expect(isExplicitBitrix24Rejection(value)).toBe(true);
+  });
+
+  it.each([
+    ["a transport error", error("TRANSPORT_ERROR")],
+    ["an abort", error("ABORTED")],
+    ["retries exhausted", error("RETRIES_EXHAUSTED")],
+    ["an unconfirmed upload", error("UPLOAD_UNCONFIRMED")],
+    ["a bare 503", error("http_503", 503)],
+    ["a bare 429", error("http_429", 429)],
+    ["a 400 without a readable code", error("http_400", 400)],
+    ["a 500 with a code", error("INTERNAL_SERVER_ERROR", 500)],
+    ["a 502 with a code", error("ERROR_CORE", 502)],
+    ["a plain Error", new Error("boom")],
+    ["undefined", undefined],
+  ])("false for %s", (_label, value) => {
+    expect(isExplicitBitrix24Rejection(value)).toBe(false);
+  });
+
+  it("classifies what the real client throws", async () => {
+    const respond = (status: number, body: string) =>
+      createBitrix24Client({
+        baseUrl: GOOD_URL,
+        portalDomains: PORTAL_DOMAINS,
+        fetchImpl: (async () => new Response(body, { status })) as unknown as typeof fetch,
+        maxRetries: 0,
+      }).call("imbot.v2.File.upload", {}, { retryTransportErrors: false });
+    const caught = async (promise: Promise<unknown>) => promise.then(() => undefined, (e: unknown) => e);
+    expect(isExplicitBitrix24Rejection(await caught(respond(400, JSON.stringify({ error: "FILE_TOO_LARGE" }))))).toBe(true);
+    expect(isExplicitBitrix24Rejection(await caught(respond(200, JSON.stringify({ error: "ACCESS_DENIED" }))))).toBe(true);
+    expect(isExplicitBitrix24Rejection(await caught(respond(503, "<html>busy</html>")))).toBe(false);
+    expect(isExplicitBitrix24Rejection(await caught(respond(400, "not json")))).toBe(false);
   });
 });
