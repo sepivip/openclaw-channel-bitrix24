@@ -169,6 +169,17 @@ docker compose restart openclaw-gateway
 | `poll.idleMs` | integer | Poll interval when idle (≥1000ms). Default `15000`. |
 | `poll.activeMs` | integer | Poll interval when active (≥500ms). Default `3000`. |
 
+### Applying changes
+
+A change under `channels.bitrix24.*` (for example approving a chat in
+`groups`, or `groupPolicy`) restarts only the Bitrix24 channel: polling pauses
+briefly and the gateway keeps running. The account reads its config once when
+it starts, so it needs a restart to see a change, but not a whole-gateway one;
+the plugin declares `reload.configPrefixes: ["channels.bitrix24"]` so OpenClaw
+restarts just this channel. The restart waits for the message being answered,
+if any (its reply still goes out), saves the poll offset after it, and the new
+poll loop resumes from there: nothing is skipped or answered twice.
+
 ## Group chats
 
 Off by default. Enabling needs both keys, and only listed chats are eligible:
@@ -415,7 +426,7 @@ on the Bitrix24 agent. A `deny` entry that covers plugin tools (such as
 Run tests locally:
 
 ```bash
-npm test          # vitest: 600 tests
+npm test          # vitest: 606 tests
 npm run typecheck # tsc --noEmit
 ```
 
@@ -428,9 +439,13 @@ Tests include:
   the real client: no retry of a bare 429/503, a timeout or a cancel
   mid-upload), captions, log hygiene, registration, and the loop guard for the
   bot's own file message
-- Hard guard, mention detection, reply degradation and poller pacing
-  (`test/guard.test.ts`, `test/mentions.test.ts`, `test/delivery.test.ts`,
-  `test/poller.test.ts`)
+- Hard guard, mention detection, reply degradation, poller pacing and what a
+  stop in the middle of a batch acknowledges (`test/guard.test.ts`,
+  `test/mentions.test.ts`, `test/delivery.test.ts`, `test/poller.test.ts`)
+- Channel restart on a config change (`test/reload.test.ts`): the
+  `reload.configPrefixes` declaration, and start, stop, start through the
+  gateway adapter against the fake server (offset resumed, one poll loop, the
+  running-account runtime unset in between, a stop mid-batch)
 - Group chats, sessions and command hand-off through the real SDK ingress and
   router (`test/groups.test.ts`), with synthetic fixtures that match real v2
   DM, group and join events (`test/fixtures.ts`)

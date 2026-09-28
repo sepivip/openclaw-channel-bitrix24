@@ -313,6 +313,7 @@ export type Bitrix24InboundDeps = {
    */
   dispatchReplyFromConfig?: unknown;
   log?: Bitrix24Log;
+  /** The account's stop signal. Cancels the typing indicator only, never a reply. */
   abortSignal?: AbortSignal;
 };
 
@@ -539,13 +540,15 @@ async function buildTurnPlan(params: {
         }
         info.assertPlatformSendAuthorized();
         await info.onPlatformSendDispatch();
+        // Not tied to the account's stop signal: a stop waits for the turn in
+        // flight and acknowledges its event as handled, so its reply must
+        // still go out. The client's own timeout bounds the send.
         const messageIds = await sendBitrix24Text({
           client: deps.client,
           botId,
           botToken: deps.botToken,
           dialogId,
           text: rendered.text,
-          ...(deps.abortSignal ? { signal: deps.abortSignal } : {}),
         });
         return { messageIds, visibleReplySent: messageIds.length > 0, content: rendered.text };
       },
@@ -899,15 +902,17 @@ async function issuePairingChallenge(params: {
 /**
  * Batch handler handed to the poller. Every event is isolated: one bad event
  * cannot abort the batch or crash the loop.
+ *
+ * A stop (a channel restart after a config change, or shutdown) never makes it
+ * skip an event: the poller acknowledges what it handed over once this
+ * returns, so a skipped event would be acknowledged but never handled. Where a
+ * stop may end a batch is the poller's call, between two events (poller.ts).
  */
 export function createBitrix24EventHandler(
   deps: Bitrix24InboundDeps,
 ): (events: unknown[]) => Promise<void> {
   return async (events: unknown[]) => {
     for (const event of events) {
-      if (deps.abortSignal?.aborted) {
-        return;
-      }
       try {
         await handleBitrix24InboundEvent({ deps, raw: (event ?? {}) as Bitrix24RawEvent });
       } catch (error) {
