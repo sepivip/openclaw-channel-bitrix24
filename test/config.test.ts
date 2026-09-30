@@ -230,6 +230,58 @@ describe("JSON schema (the SDK's runtime validator)", () => {
   });
 });
 
+describe("crmWebhookUrl (business pulse Gate 2, optional)", () => {
+  const LIVE = {
+    enabled: true,
+    webhookUrl: "https://acme.example.bitrix24.eu/rest/42/tok/",
+    botToken: "abc",
+    portalDomain: "example.bitrix24.eu",
+  };
+
+  it("is optional: an enabled account without it still resolves (the channel is unaffected)", () => {
+    const account = resolveBitrix24Account(cfg(LIVE));
+    expect(account.enabled).toBe(true);
+    expect(account.crmWebhookUrlStatus).toBe("missing");
+    expect(account.crmWebhookUrlInput).toBeUndefined();
+  });
+
+  it("is inspected like webhookUrl, literal or SecretRef, without resolving it", () => {
+    const literal = resolveBitrix24Account(
+      cfg({ ...LIVE, crmWebhookUrl: "https://acme.example.bitrix24.eu/rest/9/crmtok/" }),
+    );
+    expect(literal.crmWebhookUrlStatus).toBe("available");
+    const ref = { source: "env", provider: "default", id: "BITRIX24_CRM_WEBHOOK_URL" };
+    const secretRef = resolveBitrix24Account(cfg({ ...LIVE, crmWebhookUrl: ref }));
+    expect(secretRef.crmWebhookUrlStatus).toBe("configured_unavailable");
+    expect(secretRef.crmWebhookUrlInput).toEqual(ref);
+  });
+
+  it("inspectAccount reports its status and does not count it toward `configured`", () => {
+    const without = inspectBitrix24Account(cfg(LIVE));
+    expect(without.configured).toBe(true);
+    expect(without.crmWebhookUrlStatus).toBe("missing");
+    const withIt = inspectBitrix24Account(cfg({ ...LIVE, crmWebhookUrl: "${BITRIX24_CRM_WEBHOOK_URL}" }));
+    expect(withIt.configured).toBe(true);
+    expect(withIt.crmWebhookUrlStatus).toBe("available");
+  });
+
+  it("the runtime schema accepts a string or a SecretRef object and rejects anything else", () => {
+    const safeParse = (value: unknown) =>
+      (bitrix24ChannelConfigSchema.runtime!.safeParse(value) as { success: boolean }).success;
+    expect(safeParse({ crmWebhookUrl: "${BITRIX24_CRM_WEBHOOK_URL}" })).toBe(true);
+    expect(safeParse({ crmWebhookUrl: { source: "env", provider: "default", id: "X" } })).toBe(true);
+    expect(safeParse({ crmWebhookUrl: 42 })).toBe(false);
+    expect(safeParse({ crmWebhookUrl: { source: "env", provider: "default", id: "X", extra: 1 } })).toBe(false);
+  });
+
+  it("is marked sensitive in the UI hints of the code and the manifest", () => {
+    const manifest = JSON.parse(
+      readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+    ) as { channelConfigs: { bitrix24: { uiHints: Record<string, { sensitive?: boolean }> } } };
+    expect(manifest.channelConfigs.bitrix24.uiHints.crmWebhookUrl?.sensitive).toBe(true);
+  });
+});
+
 describe("inspectAccount", () => {
   it("never throws and reports unconfigured state without resolving secrets", () => {
     const inspected = inspectBitrix24Account(cfg({ enabled: true }));

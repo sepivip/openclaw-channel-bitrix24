@@ -1108,7 +1108,9 @@ describe("registration", () => {
     const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
     entry.register({ registrationMode: "full", runtime: {}, logger, registerTool, registerChannel });
     expect(registerChannel).toHaveBeenCalledTimes(1);
-    expect(registerTool).toHaveBeenCalledTimes(1);
+    // The send-sheet tool and the read-only pulse-data tool (Gate 2), both optional.
+    expect(registerTool).toHaveBeenCalledTimes(2);
+    expect(registerTool.mock.calls[1]?.[1]).toEqual({ name: "bitrix24_pulse_data", optional: true });
     const [factory, opts] = registerTool.mock.calls[0] as [(ctx: unknown) => { name: string }, unknown];
     expect(opts).toEqual({ name: "bitrix24_send_sheet", optional: true });
     expect(typeof factory).toBe("function");
@@ -1121,7 +1123,7 @@ describe("registration", () => {
     const entry = (await import("../src/index.js")).default as unknown as { register: (api: unknown) => void };
     const toolDiscovery = { registrationMode: "tool-discovery", registerTool: vi.fn(), registerChannel: vi.fn(), logger: {} };
     entry.register(toolDiscovery);
-    expect(toolDiscovery.registerTool).toHaveBeenCalledTimes(1);
+    expect(toolDiscovery.registerTool).toHaveBeenCalledTimes(2);
     expect(toolDiscovery.registerChannel).not.toHaveBeenCalled();
     const discovery = { registrationMode: "discovery", runtime: {}, registerTool: vi.fn(), registerChannel: vi.fn() };
     entry.register(discovery);
@@ -1129,14 +1131,15 @@ describe("registration", () => {
     expect(discovery.registerChannel).toHaveBeenCalledTimes(1);
   });
 
-  it("the manifest declares exactly this tool in contracts.tools, optional and side-effecting", () => {
+  it("the manifest declares this tool (optional, side-effecting) and the read-only pulse-data tool", () => {
     const manifest = JSON.parse(readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8")) as {
       contracts?: { tools?: string[] };
       toolMetadata?: Record<string, unknown>;
     };
-    expect(manifest.contracts?.tools).toEqual([BITRIX24_SEND_SHEET_TOOL_NAME]);
+    expect(manifest.contracts?.tools).toEqual([BITRIX24_SEND_SHEET_TOOL_NAME, "bitrix24_pulse_data"]);
     expect(manifest.toolMetadata).toEqual({
       [BITRIX24_SEND_SHEET_TOOL_NAME]: { optional: true, sideEffecting: true },
+      bitrix24_pulse_data: { optional: true, sideEffecting: false },
     });
   });
 

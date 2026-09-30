@@ -13,13 +13,18 @@
   },
   "contracts": {
     "tools": [
-      "bitrix24_send_sheet"
+      "bitrix24_send_sheet",
+      "bitrix24_pulse_data"
     ]
   },
   "toolMetadata": {
     "bitrix24_send_sheet": {
       "optional": true,
       "sideEffecting": true
+    },
+    "bitrix24_pulse_data": {
+      "optional": true,
+      "sideEffecting": false
     }
   },
   "configSchema": {
@@ -80,6 +85,40 @@
           },
           "botToken": {
             "description": "SecretInput. Caller-generated bot token (<=40 chars) required on every imbot.v2 call under webhook auth. Use ${BITRIX24_BOT_TOKEN}.",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "source",
+                  "provider",
+                  "id"
+                ],
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "enum": [
+                      "env",
+                      "file",
+                      "exec",
+                      "store"
+                    ]
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string"
+                  }
+                }
+              }
+            ]
+          },
+          "crmWebhookUrl": {
+            "description": "Optional SecretInput. READ-ONLY Bitrix24 inbound webhook for the business pulse (customer calls, read from CRM deals), created by a low-privilege service user with scope crm only: https://<portal>/rest/<userId>/<token>/ . Use ${BITRIX24_CRM_WEBHOOK_URL}. Unset: bitrix24_pulse_data answers NOT_CONFIGURED; the channel is unaffected.",
             "anyOf": [
               {
                 "type": "string"
@@ -215,6 +254,10 @@
         },
         "botToken": {
           "label": "Bot token",
+          "sensitive": true
+        },
+        "crmWebhookUrl": {
+          "label": "Read-only CRM webhook URL (business pulse)",
           "sensitive": true
         },
         "portalDomain": {

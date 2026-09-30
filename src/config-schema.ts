@@ -93,6 +93,23 @@ export const bitrix24ChannelJsonSchema = {
         },
       ],
     },
+    crmWebhookUrl: {
+      description:
+        "Optional SecretInput. READ-ONLY Bitrix24 inbound webhook for the business pulse (customer calls, read from CRM deals), created by a low-privilege service user with scope crm only: https://<portal>/rest/<userId>/<token>/ . Use ${BITRIX24_CRM_WEBHOOK_URL}. Unset: bitrix24_pulse_data answers NOT_CONFIGURED; the channel is unaffected.",
+      anyOf: [
+        { type: "string" },
+        {
+          type: "object",
+          additionalProperties: false,
+          required: ["source", "provider", "id"],
+          properties: {
+            source: { type: "string", enum: ["env", "file", "exec", "store"] },
+            provider: { type: "string" },
+            id: { type: "string" },
+          },
+        },
+      ],
+    },
     portalDomain: {
       type: "string",
       description:
@@ -168,6 +185,7 @@ export const bitrix24ChannelJsonSchema = {
 export const bitrix24ChannelUiHints = {
   webhookUrl: { label: "Inbound webhook URL", sensitive: true },
   botToken: { label: "Bot token", sensitive: true },
+  crmWebhookUrl: { label: "Read-only CRM webhook URL (business pulse)", sensitive: true },
   portalDomain: { label: "Portal domain", placeholder: "example.bitrix24.eu" },
   allowFrom: { label: "Allowed Bitrix24 user ids" },
 } as const;
@@ -193,6 +211,7 @@ export type Bitrix24ChannelConfig = {
   name?: string;
   webhookUrl?: unknown;
   botToken?: unknown;
+  crmWebhookUrl?: unknown;
   portalDomain?: string;
   dmPolicy?: Bitrix24DmPolicy;
   allowFrom?: unknown;
@@ -228,6 +247,13 @@ export type ResolvedBitrix24Account = {
   /** Sync inspection result. `"missing"` while enabled is fail-closed. */
   webhookUrlStatus: Bitrix24SecretStatus;
   botTokenStatus: Bitrix24SecretStatus;
+  /**
+   * Optional read-only CRM webhook (business pulse, Gate 2). Raw SecretInput,
+   * never logged; resolved only by the `bitrix24_pulse_data` tool. `"missing"`
+   * is NOT fail-closed for the channel: the tool answers NOT_CONFIGURED.
+   */
+  crmWebhookUrlInput: unknown;
+  crmWebhookUrlStatus: Bitrix24SecretStatus;
   portalDomains: string[];
   dmPolicy: Bitrix24DmPolicy;
   allowFrom: string[];
@@ -422,6 +448,8 @@ export function resolveBitrix24Account(
     botTokenInput: section.botToken,
     webhookUrlStatus,
     botTokenStatus,
+    crmWebhookUrlInput: section.crmWebhookUrl,
+    crmWebhookUrlStatus: inspectSecret(section.crmWebhookUrl, "channels.bitrix24.crmWebhookUrl"),
     portalDomains: portalDomain ? [portalDomain] : [],
     dmPolicy: normalizeDmPolicy(section.dmPolicy, warn),
     allowFrom: normalizeBitrix24AllowFrom(section.allowFrom, warn),
@@ -454,6 +482,8 @@ export function inspectBitrix24Account(
   configured: boolean;
   webhookUrlStatus: Bitrix24SecretStatus;
   botTokenStatus: Bitrix24SecretStatus;
+  /** Optional; does not affect `configured` (the channel runs without it). */
+  crmWebhookUrlStatus: Bitrix24SecretStatus;
   portalDomainConfigured: boolean;
   dmPolicy: Bitrix24DmPolicy;
   allowFromCount: number;
@@ -465,6 +495,7 @@ export function inspectBitrix24Account(
   const enabled = section.enabled === true;
   const webhookUrlStatus = inspectSecret(section.webhookUrl, "channels.bitrix24.webhookUrl");
   const botTokenStatus = inspectSecret(section.botToken, "channels.bitrix24.botToken");
+  const crmWebhookUrlStatus = inspectSecret(section.crmWebhookUrl, "channels.bitrix24.crmWebhookUrl");
   const portalDomainConfigured =
     typeof section.portalDomain === "string" && section.portalDomain.trim().length > 0;
   const configured =
@@ -477,6 +508,7 @@ export function inspectBitrix24Account(
     configured,
     webhookUrlStatus,
     botTokenStatus,
+    crmWebhookUrlStatus,
     portalDomainConfigured,
     dmPolicy: normalizeDmPolicy(section.dmPolicy),
     allowFromCount: normalizeBitrix24AllowFrom(section.allowFrom).length,
