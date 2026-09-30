@@ -22,6 +22,12 @@ patched.
 openclaw plugins install clawhub:@sepivip/openclaw-channel-bitrix24
 ```
 
+OpenClaw first shows ClawHub's security audit for the release and the
+plugin's declared capabilities (one channel and two optional tools), and asks
+you to accept them. In a script, review them first and add
+`--accept-capabilities`; without it a non-interactive install stops at this
+step and installs nothing.
+
 This installs and enables the plugin (its id is `bitrix24`). The channel itself
 stays off until you configure it below. If you installed from a separate shell
 while a gateway was running, restart the gateway so it loads the plugin.
