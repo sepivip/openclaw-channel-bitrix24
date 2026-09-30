@@ -11,7 +11,9 @@
 // resolveTurn) and records what the plugin handed over.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { resolveCommandAuthorization } from "openclaw/plugin-sdk/command-auth";
+// `command-auth` is a deprecated SDK barrel; `command-auth-native`
+// re-exports the same `resolveCommandAuthorization` since 2026.9.4.
+import { resolveCommandAuthorization } from "openclaw/plugin-sdk/command-auth-native";
 
 type CapturedTurn = {
   input: { rawText: string; textForAgent?: string; textForCommands?: string };

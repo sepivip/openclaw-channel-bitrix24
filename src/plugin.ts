@@ -36,7 +36,12 @@ import {
   type Bitrix24Client,
 } from "./client.js";
 import { Bitrix24ConfigError, fingerprintSecret } from "./secrets.js";
-import { createBitrix24EventHandler, describeError, type Bitrix24Log } from "./inbound.js";
+import {
+  createBitrix24EventHandler,
+  describeError,
+  type Bitrix24Log,
+  type Bitrix24UpsertPairingRequest,
+} from "./inbound.js";
 import { createBitrix24Poller, type Bitrix24Poller } from "./poller.js";
 import {
   BITRIX24_STATE_KEY_BOT_ID,
@@ -347,8 +352,12 @@ export const bitrix24Plugin = createChatChannelPlugin<ResolvedBitrix24Account>({
         }
 
         const runtimeChannel = (ctx.channelRuntime ?? getBitrix24ChannelRuntime()) as
-          | { reply?: { dispatchReplyFromConfig?: unknown } }
+          | {
+              reply?: { dispatchReplyFromConfig?: unknown };
+              pairing?: { upsertPairingRequest?: unknown };
+            }
           | undefined;
+        const upsertPairingRequest = resolveUpsertPairingRequest(runtimeChannel?.pairing);
 
         const onEvents = createBitrix24EventHandler({
           getConfig: () => ctx.cfg,
@@ -360,6 +369,7 @@ export const bitrix24Plugin = createChatChannelPlugin<ResolvedBitrix24Account>({
           ...(runtimeChannel?.reply?.dispatchReplyFromConfig
             ? { dispatchReplyFromConfig: runtimeChannel.reply.dispatchReplyFromConfig }
             : {}),
+          ...(upsertPairingRequest ? { upsertPairingRequest } : {}),
           ...(log ? { log } : {}),
           abortSignal: controller.signal,
         });
@@ -609,4 +619,19 @@ export function getBitrix24Runtime(): unknown {
 /** `PluginRuntime["channel"]` when the Gateway injected one. */
 function getBitrix24ChannelRuntime(): unknown {
   return (pluginRuntime as { channel?: unknown } | undefined)?.channel;
+}
+
+/**
+ * `PluginRuntime["channel"]["pairing"]["upsertPairingRequest"]`, called on its
+ * own object. It replaces the deprecated `conversation-runtime` barrel import;
+ * `undefined` when the Gateway supplied no channel runtime.
+ */
+function resolveUpsertPairingRequest(
+  pairing: { upsertPairingRequest?: unknown } | undefined,
+): Bitrix24UpsertPairingRequest | undefined {
+  if (!pairing || typeof pairing.upsertPairingRequest !== "function") {
+    return undefined;
+  }
+  const upsert = pairing.upsertPairingRequest as Bitrix24UpsertPairingRequest;
+  return async (params) => await upsert.call(pairing, params);
 }

@@ -32,7 +32,6 @@ import {
 } from "openclaw/plugin-sdk/channel-ingress-runtime";
 import { createChannelPairingChallengeIssuer } from "openclaw/plugin-sdk/channel-pairing";
 import { createChannelMessageReplyPipeline } from "openclaw/plugin-sdk/channel-outbound";
-import { upsertChannelPairingRequest } from "openclaw/plugin-sdk/conversation-runtime";
 import { buildAgentSessionKey, resolveAgentRoute } from "openclaw/plugin-sdk/routing";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import type { Bitrix24Client } from "./client.js";
@@ -296,6 +295,19 @@ function logAt(log: Bitrix24Log | undefined, level: keyof Bitrix24Log, text: str
   console.log(text);
 }
 
+/**
+ * The Gateway's pairing-store writer,
+ * `PluginRuntime["channel"]["pairing"]["upsertPairingRequest"]`. In 2026.9.4
+ * it forwards these fields to the same `upsertChannelPairingRequest` the
+ * deprecated `openclaw/plugin-sdk/conversation-runtime` barrel exports.
+ */
+export type Bitrix24UpsertPairingRequest = (params: {
+  channel: string;
+  id: string;
+  accountId: string;
+  meta?: Record<string, string | undefined>;
+}) => Promise<{ code: string; created: boolean }>;
+
 export type Bitrix24InboundDeps = {
   /** Live config snapshot. Re-read per batch so a hot reload is picked up. */
   getConfig: () => OpenClawConfig;
@@ -312,6 +324,12 @@ export type Bitrix24InboundDeps = {
    * core falls back to its own resolver.
    */
   dispatchReplyFromConfig?: unknown;
+  /**
+   * Pairing-store writer injected by the Gateway. Used only under
+   * dmPolicy "pairing". Without it a pairing challenge fails closed: nothing
+   * is stored and no code is sent.
+   */
+  upsertPairingRequest?: Bitrix24UpsertPairingRequest;
   log?: Bitrix24Log;
   /** The account's stop signal. Cancels the typing indicator only, never a reply. */
   abortSignal?: AbortSignal;
@@ -863,18 +881,25 @@ export async function handleBitrix24InboundEvent(params: {
   return { status: "dispatched", dispatched, agentId, sessionKey };
 }
 
-/** SDK-owned pairing challenge; the code is delivered through our own sendText. */
+/**
+ * SDK-owned pairing challenge; the request is stored through the Gateway's
+ * pairing writer and the code is delivered through our own sendText.
+ */
 async function issuePairingChallenge(params: {
   deps: Bitrix24InboundDeps;
   normalized: NormalizedBitrix24Event;
 }): Promise<void> {
   const { deps, normalized } = params;
+  const upsertPairingRequest = deps.upsertPairingRequest;
+  if (!upsertPairingRequest) {
+    throw new Error("no Gateway pairing store (channel runtime missing); pairing request not stored");
+  }
   const issue = createChannelPairingChallengeIssuer({
     channel: BITRIX24_CHANNEL_ID as never,
     accountId: deps.accountId,
     upsertPairingRequest: async ({ id, meta }) =>
-      await upsertChannelPairingRequest({
-        channel: BITRIX24_CHANNEL_ID as never,
+      await upsertPairingRequest({
+        channel: BITRIX24_CHANNEL_ID,
         id,
         accountId: deps.accountId,
         ...(meta ? { meta } : {}),
