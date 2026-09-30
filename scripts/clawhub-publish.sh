@@ -43,7 +43,7 @@ npm run build
 npm run typecheck
 npm test
 
-$CLAWHUB package validate .
+$CLAWHUB package validate . --out "$(mktemp -d)"   # reports go outside the repo
 
 rm -f ./*.tgz
 TGZ="$(npm pack --silent)"
