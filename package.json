@@ -1,9 +1,33 @@
 {
-  "name": "openclaw-channel-bitrix24",
-  "version": "0.1.0",
-  "description": "Bitrix24 channel plugin for OpenClaw (imbot.v2 fetch mode)",
+  "name": "@sepivip/openclaw-channel-bitrix24",
+  "version": "0.2.0",
+  "description": "Bitrix24 chat bot channel for OpenClaw: imbot.v2 in fetch mode, no inbound HTTP surface",
   "license": "MIT",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sepivip/openclaw-channel-bitrix24.git"
+  },
+  "homepage": "https://github.com/sepivip/openclaw-channel-bitrix24#readme",
+  "bugs": {
+    "url": "https://github.com/sepivip/openclaw-channel-bitrix24/issues"
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "openclaw-channel",
+    "bitrix24",
+    "chatbot",
+    "imbot"
+  ],
+  "files": [
+    "dist/",
+    "openclaw.plugin.json",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "NOTICE"
+  ],
   "engines": {
     "node": ">=22"
   },
@@ -20,7 +44,17 @@
       "./dist/index.js"
     ],
     "compat": {
-      "pluginApi": ">=2026.9.4"
+      "pluginApi": ">=2026.9.4",
+      "minGatewayVersion": "2026.9.4"
+    },
+    "build": {
+      "openclawVersion": "2026.9.4",
+      "pluginSdkVersion": "2026.9.4"
+    },
+    "install": {
+      "clawhubSpec": "@sepivip/openclaw-channel-bitrix24",
+      "defaultChoice": "clawhub",
+      "minHostVersion": ">=2026.9.4"
     },
     "channel": {
       "id": "bitrix24",
