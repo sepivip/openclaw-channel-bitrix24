@@ -1,563 +1,260 @@
-# openclaw-channel-bitrix24
+# Bitrix24 channel for OpenClaw
 
-An OpenClaw **channel plugin** that bridges a Bitrix24 portal's `imbot.v2` chat bot to an OpenClaw agent, in **fetch mode** (Path B): the plugin polls `imbot.v2.Event.get` outbound over the portal's inbound-webhook URL.
+Connects an OpenClaw agent to a Bitrix24 portal as an `imbot.v2` chat bot.
+People on the portal talk to the agent in direct messages and, if you allow
+it, in group chats you approve one by one.
 
-**There is no inbound HTTP surface.** No gateway HTTP route, no express, no listener, no published port, no tunnel, no DNS. Webhook forgery is eliminated by construction.
+The plugin runs in **fetch mode**: it polls `imbot.v2.Event.get` with an
+outbound HTTPS call to your portal's inbound-webhook URL. It opens no port and
+registers no HTTP route, so there is no public endpoint to find, forge or keep
+patched.
 
-Target runtime: `ghcr.io/openclaw/openclaw:2026.9.4` or later.
+- Requires OpenClaw **2026.9.4** or later. Tested on 2026.9.4, 2026.9.6 and
+  2026.9.7.
+- No runtime dependencies: the plugin imports only `openclaw/plugin-sdk/*` and
+  Node built-ins.
+- Closed by default: nothing starts until you enable the channel, only users
+  you list get answers, and group chats are off.
 
-## Path A vs Path B
-
-- **Path A** (rejected): Bitrix24 posts events to a public webhook endpoint. Risk: webhook forgery without a verifiable signature.
-- **Path B** (this plugin): OpenClaw polls Bitrix24's event queue via `imbot.v2.Event.get`. No inbound HTTP, no forgery surface.
-
-This is a **community plugin** implementing Path B after Path A was rejected for security concerns.
-
-## Security Properties
-
-* **Hardcoded method allowlist**: exactly six methods allowed:
-  - `imbot.v2.Bot.register`
-  - `imbot.v2.Bot.update`
-  - `imbot.v2.Event.get`
-  - `imbot.v2.Chat.Message.send`
-  - `imbot.v2.Chat.InputAction.notify`
-  - `imbot.v2.File.upload` (called only by the [`bitrix24_send_sheet`](#sending-sheets-bitrix24_send_sheet) tool)
-  
-  Any other method name throws synchronously. Scope creep is structurally impossible. All six need only the `imbot` scope.
-
-* **One base URL, validated at config load**: `https:` only, path must match `/rest/<digits>/<token>/`, host must end with the configured `portalDomain`.
-
-* **Secrets never reach a logger**: Every HTTP failure is wrapped before logging. Webhook URLs are never log fields; only `sha256(secret).hex.slice(0,16)` fingerprints appear.
-
-* **Default deny, enforced by core**: Per-event admission is decided by OpenClaw SDK ingress. `dmPolicy` defaults to `allowlist`; there is no `"open"` value. `allowFrom` accepts numeric Bitrix user ids only.
-
-* **Groups off by default, allowlisted when on**: `groupPolicy` is `"disabled"` (default) or `"allowlist"`; there is no `"open"`. Under `allowlist` only chats listed in `groups` (keys `chat<N>`) are eligible, and a turn starts only when the bot is @mentioned AND the sender is in `allowFrom`. See [Group chats](#group-chats).
-
-* **Hard guard before policy**: Extranet chats, chats with collabers, Open Lines / entity-linked chats, non-`chat` group types, and extranet / connector / bot / external-auth senders are refused before config, ingress or any reply (`src/guard.ts`). Fail closed: a missing safety field on a group counts as unsafe.
-
-* **Loop guard**: `data.message.authorId === botId || data.user.id === botId || data.user.bot === true` ⇒ dropped before ingress. This covers the bot's own file messages too.
-
-* **Files only through one tool**: replies never carry media. A file is sent only by the `bitrix24_send_sheet` agent tool, into the chat of the turn that called it. See [Sending sheets](#sending-sheets-bitrix24_send_sheet).
-
-* **Rate limits**: Token bucket 1.5 req/s, burst 20; exponential backoff with jitter on rate-limit errors; 20s timeout per request.
-
-* **Zero runtime dependencies**: The loaded artefact imports only `openclaw/plugin-sdk/*` and Node built-ins.
-
-## Installation
-
-### 1. Build the plugin
+## Install
 
 ```bash
-npm ci
-npm run build     # tsc -> dist/*.js
-npm test          # optional: 600 tests, no network egress
+openclaw plugins install clawhub:@sepivip/openclaw-channel-bitrix24
 ```
 
-### 2. Deploy to Docker volume
+This installs and enables the plugin (its id is `bitrix24`). The channel itself
+stays off until you configure it below. If you installed from a separate shell
+while a gateway was running, restart the gateway so it loads the plugin.
 
-OpenClaw requires plugins to have correct POSIX ownership and permissions. A Windows bind mount cannot express these, so use a Docker named volume:
+Check that it loaded:
 
 ```bash
-./scripts/sync-plugin-to-volume.sh --dry-run  # inspect first
-./scripts/sync-plugin-to-volume.sh            # sync to openclaw-plugins volume
+openclaw plugins inspect bitrix24 --runtime --json
+# expect "status": "loaded" and "compatibility": []
 ```
 
-The script:
-- Creates/updates a named volume `openclaw-plugins` (customizable with `--volume`)
-- Copies `dist/`, `package.json`, and `openclaw.plugin.json`
-- Sets ownership to `1000:1000` (OpenClaw's `node` user)
-- Sets permissions: `755` for directories, `644` for files
+Running OpenClaw in Docker and prefer to build from source? See
+[Manual install into a Docker named volume](docs/manual-install.md).
 
-### 3. Mount the volume in your compose stack
+## Set up Bitrix24
 
-Merge `docker-compose.bitrix24.yml` on top of your main compose file:
+1. **Choose who owns the webhook.** A Bitrix24 inbound webhook acts with the
+   rights of the user who creates it. A dedicated user with no admin rights is
+   the safest owner.
+2. **Create an inbound webhook** as that user: *Applications → Developer
+   resources → Other → Inbound webhook*. Grant only the **`imbot`** scope. Copy
+   the URL. It looks like `https://<portal>/rest/<userId>/<token>/`. Treat it
+   as a password: anyone holding it can act as that user within the scope.
+3. **Generate a bot token**, a random string of up to 40 characters, for
+   example with `openssl rand -hex 16`. The plugin registers the bot with it
+   and sends it on every bot call.
+4. **Find the user ids** of the people who may use the bot. A user's profile
+   URL ends in `/company/personal/user/<id>/`.
+
+## Configure
+
+Put the two secrets in the gateway's environment, for example in the `.env`
+file of your Docker Compose stack:
 
 ```bash
-docker compose \
-  -f docker-compose.yml \
-  -f docker-compose.bitrix24.yml \
-  up -d
+BITRIX24_WEBHOOK_URL=https://your-portal.bitrix24.com/rest/1/xxxxxxxxxxxxxxxx/
+BITRIX24_BOT_TOKEN=replace-with-your-random-token
 ```
 
-This adds:
-- Read-only mount: `openclaw-plugins:/opt/plugins:ro`
-- Environment variable passthroughs: `BITRIX24_WEBHOOK_URL`, `BITRIX24_BOT_TOKEN`
-
-### 4. Configure credentials
-
-Add to your `.env` file (gitignored, access-controlled):
+Configure the channel. The secrets are referenced as SecretRefs, so their
+values never land in `openclaw.json`:
 
 ```bash
-BITRIX24_WEBHOOK_URL=https://your-portal.bitrix24.eu/rest/123/abc123def456/
-BITRIX24_BOT_TOKEN=your_generated_token_here
+openclaw config set --batch-json '[
+  {"path": "channels.bitrix24.enabled", "value": false},
+  {"path": "channels.bitrix24.webhookUrl", "value": {"source": "env", "provider": "default", "id": "BITRIX24_WEBHOOK_URL"}},
+  {"path": "channels.bitrix24.botToken", "value": {"source": "env", "provider": "default", "id": "BITRIX24_BOT_TOKEN"}},
+  {"path": "channels.bitrix24.portalDomain", "value": "your-portal.bitrix24.com"},
+  {"path": "channels.bitrix24.dmPolicy", "value": "allowlist"},
+  {"path": "channels.bitrix24.allowFrom", "value": ["12345"]},
+  {"path": "channels.bitrix24.groupPolicy", "value": "disabled"},
+  {"path": "channels.bitrix24.bot.name", "value": "Assistant"}
+]'
 ```
 
-The webhook URL format: `https://<portal>/rest/<userId>/<token>/`
+`portalDomain` must match the end of the webhook URL's host; the plugin
+refuses any other host. `allowFrom` takes numeric Bitrix24 user ids as strings.
+An empty list means nobody gets an answer.
 
-The bot token: caller-generated, ≤40 characters, used for webhook authentication.
+**Route the channel to an agent.** Without a binding, Bitrix24 messages go to
+your default agent. A dedicated agent with a narrow tool policy is better,
+because everyone on `allowFrom` can talk to it. Add an entry like this to the
+top-level `bindings` list in `openclaw.json`:
 
-### 5. Configure OpenClaw
+```json5
+{ type: "route", agentId: "bitrix24-assistant", match: { channel: "bitrix24", accountId: "*" } }
+```
 
-Apply configuration via CLI (never hand-edit `openclaw.json`):
+**Enable the channel** when you are ready:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.bitrix24.yml \
-  run --rm openclaw-cli config set --batch-json '{
-    "plugins.load.paths": ["/opt/plugins/bitrix24"],
-    "plugins.entries.bitrix24.enabled": true,
-    "channels.bitrix24.enabled": false,
-    "channels.bitrix24.webhookUrl": "${BITRIX24_WEBHOOK_URL}",
-    "channels.bitrix24.botToken": "${BITRIX24_BOT_TOKEN}",
-    "channels.bitrix24.portalDomain": "your-portal.bitrix24.eu",
-    "channels.bitrix24.dmPolicy": "allowlist",
-    "channels.bitrix24.allowFrom": [],
-    "channels.bitrix24.groupPolicy": "disabled",
-    "channels.bitrix24.bot.code": "openclaw_bot",
-    "channels.bitrix24.bot.name": "Assistant",
-    "channels.bitrix24.bot.color": "PURPLE",
-    "channels.bitrix24.bot.workPosition": "AI Assistant",
-    "channels.bitrix24.poll.idleMs": 15000,
-    "channels.bitrix24.poll.activeMs": 3000
-  }'
+openclaw config validate
+openclaw config set channels.bitrix24.enabled true
 ```
 
-**Important**: `channels.bitrix24.enabled` is initially `false`. Nothing starts until you explicitly enable it.
+The channel starts without a gateway restart. The gateway log should show
+`imbot.v2.Bot.register ok` with the bot id, then polling. Send the bot a
+direct message from a user on `allowFrom`.
 
-### 6. Configure allowlist
+## Security model
 
-Add Bitrix24 user IDs to `allowFrom`:
-
-```bash
-docker compose run --rm openclaw-cli config set \
-  channels.bitrix24.allowFrom "[\"12345\",\"67890\"]"
-```
-
-Replace `12345` and `67890` with actual numeric Bitrix24 user IDs who should be allowed to use the bot.
-
-### 7. Enable the channel
-
-When ready:
-
-```bash
-docker compose run --rm openclaw-cli config set \
-  channels.bitrix24.enabled true
-```
-
-Validate and restart:
-
-```bash
-docker compose run --rm openclaw-cli config validate
-docker compose restart openclaw-gateway
-```
-
-## Configuration Reference
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `enabled` | boolean | Default `false`. Nothing starts until explicitly `true`. |
-| `webhookUrl` | SecretInput | Bitrix24 inbound webhook base URL. Use `${BITRIX24_WEBHOOK_URL}`. |
-| `botToken` | SecretInput | Caller-generated bot token (≤40 chars). Use `${BITRIX24_BOT_TOKEN}`. |
-| `portalDomain` | string | Portal domain for URL validation, e.g. `example.bitrix24.eu`. |
-| `dmPolicy` | enum | `"allowlist"` \| `"pairing"` \| `"disabled"`. Default `"allowlist"`. No `"open"` value. |
-| `allowFrom` | array | Numeric Bitrix24 user IDs. Empty = nobody allowed. |
-| `groupPolicy` | enum | `"disabled"` \| `"allowlist"`. Default `"disabled"`. No `"open"` value. See [Group chats](#group-chats). |
-| `groups` | object | Eligible group chats keyed by dialog id `chat<N>`: `{ "chat<N>": { requireMention?: boolean } }`, `requireMention` default `true`. Unlisted chats are ignored. |
-| `bot.code` | string | Bot identifier. Default `"openclaw_bot"`. |
-| `bot.name` | string | Display name. Default `"Assistant"`. |
-| `bot.color` | string | Bot color. Default `"PURPLE"`. |
-| `bot.workPosition` | string | Bot subtitle. Default `"AI Assistant"`. |
-| `poll.idleMs` | integer | Poll interval when idle (≥1000ms). Default `15000`. |
-| `poll.activeMs` | integer | Poll interval when active (≥500ms). Default `3000`. |
-
-### Applying changes
-
-A change under `channels.bitrix24.*` (for example approving a chat in
-`groups`, or `groupPolicy`) restarts only the Bitrix24 channel: polling pauses
-briefly and the gateway keeps running. The account reads its config once when
-it starts, so it needs a restart to see a change, but not a whole-gateway one;
-the plugin declares `reload.configPrefixes: ["channels.bitrix24"]` so OpenClaw
-restarts just this channel. The restart waits for the message being answered,
-if any (its reply still goes out), saves the poll offset after it, and the new
-poll loop resumes from there: nothing is skipped or answered twice.
+- **Six Bitrix24 methods, fixed in code.** `imbot.v2.Bot.register`,
+  `Bot.update`, `Event.get`, `Chat.Message.send`, `Chat.InputAction.notify` and
+  `File.upload` (the last only for the optional sheet tool). Any other method
+  name throws before a request is made. All six need only the `imbot` scope.
+- **One validated base URL.** The webhook URL must be `https:`, its path must
+  be `/rest/<digits>/<token>/`, and its host must end with `portalDomain`.
+- **Secrets stay out of logs.** Failures are wrapped before logging. Webhook
+  URLs and tokens never appear in log fields; at most a 16-character SHA-256
+  fingerprint does.
+- **Default deny, enforced by OpenClaw's own ingress.** `dmPolicy` is
+  `allowlist` by default and has no `open` value. `allowFrom` accepts numeric
+  user ids only.
+- **Hard guard before any policy.** Extranet chats, chats with collabers, Open
+  Lines and other entity-linked chats, and extranet, connector, bot or
+  external-auth senders are refused before config, ingress or any reply. A
+  missing safety field on a group counts as unsafe.
+- **Loop guard.** The bot's own messages, and messages from any bot, are
+  dropped.
+- **No media in replies.** A reply is text only. A file can be sent only by
+  the optional `bitrix24_send_sheet` tool, and only into the chat of the turn
+  that called it.
+- **Rate limits.** A token bucket of 1.5 requests per second (burst 20),
+  exponential backoff with jitter on rate-limit errors, and a 20 s timeout per
+  request.
 
 ## Group chats
 
-Off by default. Enabling needs both keys, and only listed chats are eligible:
+Off by default. To answer in a group, set `groupPolicy` to `"allowlist"` and
+list the chat under `groups` by its dialog id:
 
 ```json5
 channels: {
   bitrix24: {
-    groupPolicy: "allowlist",                 // default "disabled"; there is no "open"
-    groups: { "chat<N>": { requireMention: true } },  // requireMention defaults to true
-    // group senders are matched against allowFrom; there is no separate groupAllowFrom
+    groupPolicy: "allowlist",                          // "disabled" or "allowlist"; there is no "open"
+    groups: { "chat123": { requireMention: true } },   // requireMention defaults to true
   },
 },
 ```
 
-Per `ONIMBOTV2MESSAGEADD`, in this order (`src/inbound.ts`):
+In a listed chat, the bot answers only when it is @mentioned **and** the
+sender is on `allowFrom`. Everyone in the chat can read its answers, so approve
+only chats whose members may see what the agent can see. Each group gets its
+own session. Commands still work only for the owners in `commands.allowFrom`,
+and in a group they also need the @mention.
 
-1. **Loop guard.** The bot's own messages and bot senders are dropped.
-2. **Hard guard** (`src/guard.ts`), every event, DM or group. Refused (no
-   reply, info log `reason=<rule>`): `chat.entityType` non-empty (Open Lines
-   and any entity-linked chat); `chat.extranet === true`;
-   `chat.containsCollaber === true`; sender `extranet`, `connector` or `bot`;
-   sender `externalAuthId` one of the documented external types `email`,
-   `replica`, `bot`, `imconnector`. This is a denylist: employees carry
-   `default`, `socservices` (social/SSO sign-in) or other values, and those
-   pass this rule; they still have to be on `allowFrom`. Groups additionally
-   need `chat.extranet === false` and `chat.containsCollaber === false` (a
-   missing field is unsafe), `chat.type === "chat"`, `chat.messageType` absent
-   or `"C"`, and `user.id` equal to `message.authorId`. A DM needs a numeric
-   dialog id. A normal employee's DM behaves as before.
-3. **Eligibility.** A group is ignored (info log) unless `groupPolicy` is
-   `allowlist` and its dialog id is a key of `groups`.
-4. **Mention** (`src/mentions.ts`): the bot's `[USER=<botId>]…[/USER]`, with
-   `<botId>` = `data.bot.id`, is detected and stripped. The format is not
-   documented but was confirmed on a real v2 group event: `message.params` is
-   empty and there is no structured mentions field. The stripped text is what
-   the agent sees and what commands are parsed from. Bitrix itself sends no
-   event for an unmentioned group message to a `bot`-type bot, so core's
-   `requireMention` gate is a second layer.
-5. **Core ingress** decides: `groupPolicy`, `groupAllowFrom = allowFrom`, and
-   the activation gate (`mentionFacts` + `requireMention`,
-   `allowTextCommands: false`, so not even a command bypasses the mention).
-6. **Session.** A group runs in its own session
-   (`agent:<agent>:bitrix24:group:chat<N>`, core's default
-   `session.groupScope: "per-group"`). If config folds groups into the main
-   session, the message is refused with a warning.
+When someone adds the bot to a chat, the gateway logs the chat's dialog id, who
+added it, the hard-guard verdict and whether the chat is listed. The bot never
+answers that event. Unlisted chats are ignored with an info log line.
 
-Commands stay owner-only through core's `commands.allowFrom`, which matches
-the sender id; the plugin hands core the real author (`data.user.id`,
-falling back to `message.authorId`) and the mention-stripped command text.
-Replies in a group are visible to every member of that chat.
+The full admission order is in [Group chats in detail](docs/group-chats.md).
 
-`ONIMBOTV2JOINCHAT` (bot added to a chat) is logged once at info with the
-dialog id, who added the bot, the chat type, the hard-guard verdict and
-whether the chat is listed. The bot never replies to it. When the bot created
-the chat itself, Bitrix reports the bot as the user who added it; that is
-logged as `addedBy=self` (another bot: `addedBy=bot:<id>`).
+## Configuration reference
 
-The poller waits 2 s after an `Event.get` page with `hasMore: true` before
-fetching the next one, as the imbot.v2 contract requires.
+All keys live under `channels.bitrix24`.
 
-## Reply delivery
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Nothing polls or registers until this is `true`. |
+| `webhookUrl` | SecretInput | | Inbound webhook base URL, `https://<portal>/rest/<userId>/<token>/`. |
+| `botToken` | SecretInput | | Your bot token, up to 40 characters. |
+| `portalDomain` | string | | The webhook host must end with this, e.g. `example.bitrix24.com`. |
+| `dmPolicy` | `"allowlist"` \| `"pairing"` \| `"disabled"` | `"allowlist"` | Who may open a direct conversation. There is no `"open"`. |
+| `allowFrom` | string[] | `[]` | Numeric Bitrix24 user ids allowed to talk to the bot, in DMs and groups. |
+| `groupPolicy` | `"disabled"` \| `"allowlist"` | `"disabled"` | Whether listed group chats are eligible. |
+| `groups` | object | | Eligible chats keyed `chat<N>`: `{ requireMention?: boolean }`, default `true`. |
+| `bot.code` | string | `"openclaw_bot"` | The bot's code on the portal. Keep it stable: a new code registers a second bot. |
+| `bot.name` | string | `"Assistant"` | Display name. |
+| `bot.color` | string | `"PURPLE"` | Avatar colour. |
+| `bot.workPosition` | string | `"AI Assistant"` | Subtitle under the name. |
+| `poll.idleMs` | integer | `15000` | Poll interval when idle, at least 1000. |
+| `poll.activeMs` | integer | `3000` | Poll interval while a conversation is active, at least 500. |
+| `crmWebhookUrl` | SecretInput | | Only for the optional `bitrix24_pulse_data` tool. A separate webhook with the `crm` scope. |
 
-Core hands this channel the raw reply payload (`preparePayload`, then
-`deliverWithProviderMessageSending`) and renders no cards on this route.
-`src/delivery.ts` degrades everything to plain text with the SDK's own
-renderers (`openclaw/plugin-sdk/interactive-runtime`): a presentation with
-`presentationTextMode: "fallback"` sends its text (for example `/status`); any
-other presentation, and legacy `interactive` buttons, are rendered as text
-lines (command buttons show the command; callback values are never shown).
-`channelData` is opaque transport data: with text the text is sent, alone it
-is declined. Media in a reply is never sent (files go only through the
-`bitrix24_send_sheet` tool, below). A payload with nothing visible is declined
-with a warning naming the reply kind and the payload's key names; no content
-is logged, and no empty message is ever sent.
+A change under `channels.bitrix24` restarts only this channel, not the
+gateway. Polling pauses for a moment, the message being answered (if any)
+still gets its reply, and polling resumes from the saved offset, so nothing is
+skipped or answered twice.
 
-## Sending sheets (`bitrix24_send_sheet`)
+## Replies
 
-The plugin registers one agent tool, `bitrix24_send_sheet`. It asks a local
-export service for a server-built `.xlsx` and posts it into the **current**
-Bitrix24 chat with `imbot.v2.File.upload`. The rows and the file bytes never
-pass through the model; the model gets a short summary computed by the server.
+Bitrix24 chat understands BB-code, not Markdown. The plugin escapes the
+agent's text and converts common Markdown (bold, italics, code, links, bullet
+lists) to real BB tags. Long replies are split into messages of at most 4,000
+characters.
+Cards and buttons that OpenClaw produces, such as `/status`, arrive as plain
+text; callback values are never shown.
 
-**Arguments** (JSON Schema, `additionalProperties: false`):
+## Optional tools
 
-```json
-{
-  "type": "object",
-  "additionalProperties": false,
-  "required": ["kind"],
-  "properties": {
-    "kind": { "type": "string", "enum": ["stock"] },
-    "warehouse_code": { "type": "string", "pattern": "^[A-Za-z0-9-]{1,32}$" },
-    "as_of": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
-    "lang": { "type": "string", "enum": ["en", "ka"] }
-  }
-}
-```
+The plugin also registers two agent tools. Both are declared optional: no
+agent sees them until its tool policy names them, for example
+`agents.entries.<agent id>.tools.alsoAllow: ["bitrix24_pulse_data"]`. A `deny` entry that covers plugin tools,
+such as `group:plugins`, blocks them. Only the agent the channel is routed to
+(through `bindings`) may call either one.
 
-There is no chat, dialog, user or target argument. The arguments are
-validated again at runtime, and any other key (`dialogId`, `chatId`, `to`,
-`target`, ...) is refused with `TARGET_NOT_ALLOWED`.
+Both were built for one production deployment and carry its assumptions. Read
+their pages before enabling them.
 
-**Where the file goes.** Only to the trusted turn context that core hands the
-tool (`deliveryContext`): its channel must be `bitrix24` and its target a
-numeric user id (DM) or `chat<N>` (group).
-
-**Who asked for it.** The turn must also name the Bitrix24 user who wrote
-(`requesterSenderId`); real Bitrix24 turns always do. Outside a Bitrix24 turn
-the tool refuses with `NOT_A_BITRIX_TURN`, and that includes a call that only
-carries a bitrix24 route: an operator `POST /tools/invoke` with
-`x-openclaw-message-channel: bitrix24` and `x-openclaw-message-to: chat<N>`,
-or a cron or subagent run with a bitrix24 `deliveryContext`. The target is
-then checked again against the live config: a DM must be in `allowFrom` (and
-`dmPolicy` not `disabled`); a group needs `groupPolicy: "allowlist"` and a
-`groups` entry; the sender must be a numeric id in `allowFrom` and, in a DM,
-own it.
-
-**Who may call it.** Only the agent the `bitrix24` channel routes to, read
-from `bindings`: `type` `"route"` (or missing), `match.channel: "bitrix24"`,
-and `match.accountId` `"*"`, this account, or omitted (the default account).
-No such binding, or bindings naming more than one agent: refused. The account
-must be running (its live client, bot id and bot token are used).
-
-**The export service.** One pinned URL, a constant in `src/sheets.ts`:
-`POST http://127.0.0.1:8765/exports/stock` (loopback; redirects are errors;
-180 s timeout). The bearer token comes from the gateway environment variable
-`ONESOFT_MCP_TOKEN`; missing or shorter than 32 characters, the tool refuses
-with `EXPORT_NOT_CONFIGURED` and makes no request. This is an outbound request
-on loopback only: the plugin still opens no port and registers no route.
-
-**Checks before upload.** The response is capped at 7.5 MiB before it is
-parsed. Then: `ok === true`; `file_name` matches
-`^[A-Za-z0-9._-]{1,120}\.xlsx$` (no leading dot); `mime_type` is exactly
-`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`;
-`content_base64` is canonical Base64; the bytes start with `PK\x03\x04` and are
-at most 5 MiB; every `summary` field has its exact type (integers, decimal
-strings, booleans, `YYYY-MM-DD`), rows never exceed the available total, the
-warehouse matches the request, and when the request named an `as_of` the
-summary's `as_of` equals it. Two summary counters are optional non-negative
-integers, 0 when absent (an older export service does not send them):
-`items_without_name` (lines without an item name) and `null_amounts` (lines
-whose amount was null upstream).
-
-**Export errors.** A non-200 export response is mapped by the service's own
-`code` first (on any status; codes that are not a safe token count as no
-code), then by the HTTP status:
-
-| Service `code` or status | Tool `error_code` | Message |
-|---|---|---|
-| `TOO_LARGE`, or 413 | `EXPORT_TOO_LARGE` | the export is too large for one sheet; ask for one warehouse |
-| `UNKNOWN_WAREHOUSE` | `EXPORT_NOT_FOUND` | no warehouse has that code |
-| `NAMES_UNAVAILABLE` | `EXPORT_NAMES_UNAVAILABLE` | item names are not loaded on the export service; ask the operator |
-| `NOT_CONFIGURED` | `EXPORT_NOT_CONFIGURED` | export service is not configured |
-| other 503 | `EXPORT_UNAVAILABLE` | export service is unavailable right now |
-| 504 | `EXPORT_TIMEOUT` | export service timed out reading the data |
-| 401, 403 | `EXPORT_UNAUTHORIZED` | export service refused the credentials |
-| 400, 405, 422 | `EXPORT_BAD_REQUEST` | export service rejected the request |
-| anything else, including a 404 with another code or none | `EXPORT_UPSTREAM_ERROR` | export service failed |
-
-`EXPORT_NOT_CONFIGURED` is shared with the local check (token missing or too
-short, message `export service not configured`, no request made); the
-service's code in the message tells them apart.
-
-**Upload.** `imbot.v2.File.upload` with `{botId, botToken, dialogId, fields:
-{name, content, message}}` and a 60 s timeout. The upload is not idempotent,
-so it is never repeated when Bitrix may already have processed it: no retry
-after a timeout, a transport error, or a bare HTTP 429/503 without a Bitrix
-error code (a proxy can answer 503 after the work was done). It is retried
-only on an explicit rate-limit code (`QUERY_LIMIT_EXCEEDED`,
-`OPERATION_TIME_LIMIT`), which Bitrix sends when it blocked the call before
-running it. Other Bitrix calls keep the default: they also retry transport
-errors and a bare 429/503. The caption is plain text built only from the
-server summary, in English or Georgian (`lang`), for example:
-`Stock at Main (WH-01) as of 2026-01-15: 2700 lines, total quantity 12345.678. Source: 1C copy.`
-When the export was truncated it adds
-`Truncated: <rows> of <total> lines shown. Total quantity of all lines: <total_quantity_all>.`
-When `items_without_name` is above 0 it adds `<n> lines have no item name.`
-(`1 line has no item name.` for one; Georgian:
-`<n> სტრიქონს არ აქვს საქონლის დასახელება.`).
-
-**Confirmed or not.** The file counts as sent only when Bitrix returns a real
-message id (a positive integer). Every failed upload is one of two codes:
-
-* `UPLOAD_FAILED`: Bitrix answered with an explicit error code in a JSON body
-  that means it rejected the request (any code on a 2xx or 4xx response, such
-  as `FILE_TOO_LARGE` or an access error, or a rate-limit code after the
-  retries). The file is not in the chat.
-* `UPLOAD_UNCONFIRMED`: the file may already be in the chat. A transport
-  error, a timeout (also while reading a 200 body), a cancel after the upload
-  request started, an HTTP 5xx or 429 without a Bitrix code, a body that
-  cannot be read, a 5xx with any other code, or a success response without a
-  message id (a file id alone, or a message id of 0, null or ""). The model is
-  told not to call the tool again and to ask the user to check the chat.
-
-A cancel before the upload starts is `ABORTED`: nothing was uploaded.
-
-**Result for the model.** Success:
-`{ok: true, file_name, rows, total_rows_available, total_quantity,
-total_quantity_all, as_of, warehouse_code, warehouse_name, truncated,
-items_without_name, null_amounts, message_id}`. Failure:
-`{ok: false, error_code, message}`; nothing is claimed as sent. The codes:
-
-| `error_code` | Meaning |
-|---|---|
-| `INVALID_ARGUMENTS` | the arguments fail the runtime re-validation |
-| `TARGET_NOT_ALLOWED` | an argument tried to choose the destination (`dialogId`, `chatId`, `to`, ...) |
-| `NOT_A_BITRIX_TURN` | no bitrix24 `deliveryContext`, or no requesting Bitrix24 user on the turn |
-| `INVALID_TARGET` | the current conversation is not a numeric DM id or `chat<N>` |
-| `UNKNOWN_ACCOUNT` | the turn's account is unknown, or the turn names two accounts |
-| `CONFIG_UNAVAILABLE` | no runtime config |
-| `AGENT_NOT_RESOLVED` | no bitrix24 route binding, or bindings naming more than one agent |
-| `AGENT_NOT_ALLOWED` | the calling agent is not the one bound to the channel |
-| `CHANNEL_UNAVAILABLE` | the channel is not configured or is disabled |
-| `DM_TARGET_NOT_ALLOWED` | the DM is not in `allowFrom`, or `dmPolicy` is `disabled` |
-| `GROUP_TARGET_NOT_ALLOWED` | the chat is not listed in `groups`, or `groupPolicy` is not `allowlist` |
-| `SENDER_NOT_ALLOWED` | the sender is not a numeric id in `allowFrom`, or does not own the DM |
-| `ACCOUNT_NOT_RUNNING` | the account is not running |
-| `ABORTED` | the turn was cancelled before the upload started; nothing was uploaded |
-| `EXPORT_*` | the export failed (table above, plus `EXPORT_UNREACHABLE`, `EXPORT_ABORTED`, `EXPORT_INVALID_RESPONSE` and the local size caps as `EXPORT_TOO_LARGE`); nothing was uploaded |
-| `UPLOAD_FAILED` | Bitrix24 refused the upload (`<CODE>`); the file was not sent |
-| `UPLOAD_UNCONFIRMED` | the upload may already be in the chat; do not send it again |
-| `INTERNAL_ERROR` | an unexpected error; the file was not sent |
-
-The tool description tells the model to say "sent" only on `ok: true`, not to
-call the tool again after `UPLOAD_UNCONFIRMED`, and to suggest one warehouse
-after `EXPORT_TOO_LARGE` instead of retrying.
-
-**Logs.** One line per call: on success (info)
-`[bitrix24] sheet sent kind=stock dialog=<id> rows=<n> bytes=<n> file=<name> messageId=<id>`;
-on `UPLOAD_UNCONFIRMED` (warn) `[bitrix24] sheet unconfirmed code=UPLOAD_UNCONFIRMED`;
-on any other failure (warn) `[bitrix24] sheet not sent code=<CODE>`. The
-token, the export URL, the file bytes and row data are never logged.
-
-**Enabling it.** The tool is declared in `openclaw.plugin.json`
-(`contracts.tools`, with `toolMetadata` `optional: true`), so no agent sees it
-until its tool policy names it, for example `alsoAllow: ["bitrix24_send_sheet"]`
-on the Bitrix24 agent. A `deny` entry that covers plugin tools (such as
-`group:plugins`) blocks it, because deny wins over allow. The gateway needs
-`ONESOFT_MCP_TOKEN` in its environment and the export service listening on
-`127.0.0.1:8765` in the same network namespace.
-
-## Customer-calls data (`bitrix24_pulse_data`)
-
-An optional, **read-only** agent tool for a "business pulse" skill, built for a
-portal whose CRM deals are logged customer calls (one pipeline; in-progress
-stages, one won stage, and failure stages that are really call topics; no
-amounts). It returns one section, `calls`: calls created and closed in the last
-7 days against the 7 before, calls waiting now (count, oldest in days, how many
-over 2 days), the median hours to close over the last 7 days, the call topics
-(closing stages) of the last 7 days, and closed calls per pipeline.
-
-* **Separate webhook, separate client.** `channels.bitrix24.crmWebhookUrl`
-  (optional SecretInput, `${BITRIX24_CRM_WEBHOOK_URL}`), created by a
-  low-privilege service user with scope `crm` only and a CRM role that can only
-  read deals. `src/crm-client.ts` allows exactly `crm.item.list`,
-  `crm.category.list` and `crm.status.list`; anything else (every write,
-  `batch`, tasks, calendar, `user.get`) throws `METHOD_NOT_ALLOWED`
-  synchronously, before any request. The imbot client and its allowlist are
-  unchanged.
-* **Counts only.** Deals are read with `id`, `categoryId`, `stageId`,
-  `createdTime` and `movedTime`; never a title, amount, person or contact.
-* **Limits.** At most 2 request starts per second per call, 60 s per request,
-  one retry on `QUERY_LIMIT_EXCEEDED` / `OPERATION_TIME_LIMIT`, 50 rows per
-  page, at most 40 pages per listing (`meta.truncated` when hit). A normal run
-  is about 10 requests.
-* **Caller.** Only the agent the bitrix24 channel routes to (`bindings`), taken
-  from the host-set tool context `agentId`. Any other agent or a call without
-  an agent id: `NOT_BITRIX_AGENT`, no request.
-* **Failures.** Unset webhook, disabled channel or a URL outside
-  `portalDomain`: `NOT_CONFIGURED`, no request. No visible deal pipeline
-  (Bitrix answers empty lists, not errors, without read rights):
-  `NO_CRM_ACCESS`, never "zero calls". When every requested section failed the
-  call is `ALL_SECTIONS_UNAVAILABLE` with the per-section codes.
-* **Windows** are whole days in Asia/Tbilisi (the portal this was built for):
-  last 7 = today-6 .. today, prior 7 = today-13 .. today-7.
-* **Enabling it.** Set `crmWebhookUrl` and add `bitrix24_pulse_data` to the
-  agent's `alsoAllow` (the tool is `optional: true`, `sideEffecting: false`).
-
-## Testing
-
-Run tests locally:
-
-```bash
-npm test          # vitest: 806 tests
-npm run typecheck # tsc --noEmit
-```
-
-Tests include:
-- Unit tests for config, client, secrets, inbound/outbound handlers
-- The sheet tool and the export fetch (`test/tools.test.ts`,
-  `test/sheets.test.ts`): argument, target and missing-sender refusals, agent
-  resolution from bindings, the export error mapping, every
-  response-validation rejection, refused vs unconfirmed uploads (also through
-  the real client: no retry of a bare 429/503, a timeout or a cancel
-  mid-upload), captions, log hygiene, registration, and the loop guard for the
-  bot's own file message
-- Hard guard, mention detection, reply degradation, poller pacing and what a
-  stop in the middle of a batch acknowledges (`test/guard.test.ts`,
-  `test/mentions.test.ts`, `test/delivery.test.ts`, `test/poller.test.ts`)
-- Channel restart on a config change (`test/reload.test.ts`): the
-  `reload.configPrefixes` declaration, and start, stop, start through the
-  gateway adapter against the fake server (offset resumed, one poll loop, the
-  running-account runtime unset in between, a stop mid-batch)
-- Group chats, sessions and command hand-off through the real SDK ingress and
-  router (`test/groups.test.ts`), with synthetic fixtures that match real v2
-  DM, group and join events (`test/fixtures.ts`)
-- Integration test with a fake Bitrix24 server (`test/fake-bitrix/server.mjs`)
-- No network egress; all tests run offline
-
-### Test-only escape hatch
-
-`allowInsecureHttpForTests: true` permits plain `http://` webhook URLs for offline testing with the fake server. It is **double-gated**:
-1. Config flag must be `true`, AND
-2. Process must have `NODE_ENV=test` OR `BITRIX24_ALLOW_INSECURE_HTTP=1`
-
-**Never enable in production.**
-
-## Smoke Test Checklist
-
-After deployment:
-
-- [ ] Plugin loads: `docker compose logs openclaw-gateway | grep bitrix24`
-- [ ] Account starts when `enabled: true`: check logs for bot registration
-- [ ] DM from allowed user arrives and generates response
-- [ ] DM from non-allowed user is blocked (logged at debug)
-- [ ] Group chat message is ignored (info log with a reason) unless `groupPolicy` is `allowlist`, the chat is listed in `groups`, the bot is @mentioned and the sender is in `allowFrom`
-- [ ] `/status` and other card/button replies arrive as plain text
-- [ ] Bot does not echo its own messages
-- [ ] Markdown formatting works (BBCode conversion)
-- [ ] Long messages are chunked correctly (4000-char limit)
-- [ ] If the sheet tool is enabled: a stock sheet request in an allowed DM posts a file from the bot, the log shows one `sheet sent` line, and the bot's own file message is not answered
+- **`bitrix24_send_sheet`** asks a local export service on
+  `127.0.0.1:8765` for a server-built `.xlsx` and posts it into the current
+  chat. It is useful only if you run a service with the same contract.
+  [Contract and error codes](docs/tools/bitrix24_send_sheet.md).
+- **`bitrix24_pulse_data`** is read-only. It summarises CRM deals that a
+  portal uses as a customer-call log, over whole days in Asia/Tbilisi, through
+  a separate `crm`-scope webhook limited in code to three read methods.
+  [Details](docs/tools/bitrix24_pulse_data.md).
 
 ## Troubleshooting
 
-**Plugin not loading**
-- Check `plugins.load.paths` points to correct volume mount
-- Verify volume exists: `docker volume ls | grep openclaw-plugins`
-- Check ownership: run `sync-plugin-to-volume.sh` again
+**Plugin not listed or not loaded.** Run
+`openclaw plugins inspect bitrix24 --runtime --json` and read `status` and
+`diagnostics`. After installing from a separate shell, restart the gateway.
 
-**Account not starting**
-- Check `channels.bitrix24.enabled` is `true`
-- Verify both `${BITRIX24_WEBHOOK_URL}` and `${BITRIX24_BOT_TOKEN}` resolve
-- Check `portalDomain` matches webhook URL host
-- Review logs: `docker compose logs openclaw-gateway`
+**Channel does not start.** Check that `channels.bitrix24.enabled` is `true`,
+that both environment variables are set in the **gateway's** environment (an
+empty value counts as missing), and that `portalDomain` matches the webhook
+host. `openclaw config validate` reports secrets that do not resolve.
 
-**Bot registered but no messages arrive**
-- Verify `allowFrom` includes the sender's Bitrix24 user ID
-- Check poll interval: maybe increase `poll.idleMs`/`poll.activeMs` temporarily
-- Look for rate limit errors in logs
+**Bot registered, but no answers.** The sender's numeric id must be on
+`allowFrom`. A direct message from anyone else is logged at warn level as
+`Blocked unauthorized bitrix24 sender <id>`.
 
-**Bot silent in a group chat**
-- Check `groupPolicy` is `"allowlist"` and the chat's dialog id (`chat<N>`) is a key of `groups`
-- The message must @mention the bot, and the sender must be in `allowFrom`
-- Look for `ignored group message ... reason=` or `(hard guard) ... reason=` info lines in the logs
+**Silent in a group chat.** `groupPolicy` must be `"allowlist"`, the chat's
+`chat<N>` id must be a key of `groups`, the message must @mention the bot, and
+the sender must be on `allowFrom`. Look for `ignored group message ... reason=`
+or hard-guard lines in the log.
 
-**Messages not sending**
-- Check Bitrix24 API response in logs
-- Verify bot token is correct
-- Confirm webhook URL is valid and accessible
+**Rate-limit errors.** Raise `poll.idleMs` and `poll.activeMs`. The client
+already backs off on its own.
 
-## Named Volume Note (Windows)
+## Development
 
-On Windows, Docker Desktop's default 9p/drvfs bind mounts cannot express POSIX ownership and modes that OpenClaw's plugin loader requires. That's why this plugin uses a **named volume** (`openclaw-plugins`) managed via `sync-plugin-to-volume.sh`.
+```bash
+npm ci            # installs with lifecycle scripts disabled (.npmrc)
+npm run build     # tsc -> dist/
+npm run typecheck
+npm test          # vitest, fully offline
+```
 
-If you see "plugin refused to load" or similar errors, re-run the sync script to fix permissions.
+The tests cover config, the REST client, secrets, inbound and outbound
+handling, the hard guard, mentions, reply degradation, poller pacing, the
+channel restart on a config change, group sessions through the real SDK
+ingress, both optional tools, and an integration run against a fake Bitrix24
+server (`test/fake-bitrix/server.mjs`). They make no network calls.
+
+`allowInsecureHttpForTests: true` allows a plain `http://` webhook URL for the
+fake server. It works only when the process also has `NODE_ENV=test` or
+`BITRIX24_ALLOW_INSECURE_HTTP=1`. Never set it in production.
+
+Contributions are welcome. Please run the tests and the typecheck, follow the
+existing style, and add tests for new behaviour.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-Contributions welcome! Please:
-1. Run tests: `npm test`
-2. Run typecheck: `npm run typecheck`
-3. Follow existing code style
-4. Add tests for new features
-
-## Acknowledgments
-
-This plugin was developed as a secure alternative to Path A (webhook receiver) after security review identified webhook forgery risks. It demonstrates that Bitrix24 integration is possible without an inbound HTTP surface.
+MIT. See [LICENSE](LICENSE).

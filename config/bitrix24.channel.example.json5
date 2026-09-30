@@ -1,9 +1,9 @@
 // EXAMPLE ONLY — documented, NOT applied.
 //
 // The `channels.bitrix24` configuration block with every switch in its safe position.
-// Nothing here is a secret: the two credentials are `${ENV}` SecretInput shorthands
-// resolved by OpenClaw core at runtime, so the real values live only in your .env file
-// (which should be gitignored and access-controlled) and never land in openclaw.json.
+// Nothing here is a secret: the two credentials are env SecretRefs resolved by
+// OpenClaw core at runtime, so the real values live only in the gateway environment
+// (for example a gitignored, access-controlled .env file) and never land in openclaw.json.
 
 {
   plugins: {
@@ -24,9 +24,9 @@
       // Nothing polls and nothing registers while false.
       enabled: false,
 
-      // SecretInput env shorthand. Resolved by core; never stored in openclaw.json.
-      webhookUrl: "${BITRIX24_WEBHOOK_URL}",
-      botToken: "${BITRIX24_BOT_TOKEN}",
+      // Env SecretRefs. Resolved by core; the values are never stored in openclaw.json.
+      webhookUrl: { source: "env", provider: "default", id: "BITRIX24_WEBHOOK_URL" },
+      botToken: { source: "env", provider: "default", id: "BITRIX24_BOT_TOKEN" },
 
       // Host gate for the REST client. The webhook host must END WITH this.
       portalDomain: "example.bitrix24.eu",
@@ -72,25 +72,19 @@
 // SecretInput contract and the backup path all stay intact:
 //
 //   docker compose -f docker-compose.yml -f docker-compose.bitrix24.yml \
-//     run --rm openclaw-cli config set --batch-json '{
-//       "plugins.load.paths": ["/opt/plugins/bitrix24"],
-//       "plugins.entries.bitrix24.enabled": true,
-//       "channels.bitrix24.enabled": false,
-//       "channels.bitrix24.webhookUrl": "${BITRIX24_WEBHOOK_URL}",
-//       "channels.bitrix24.botToken": "${BITRIX24_BOT_TOKEN}",
-//       "channels.bitrix24.portalDomain": "example.bitrix24.eu",
-//       "channels.bitrix24.dmPolicy": "allowlist",
-//       "channels.bitrix24.allowFrom": [],
-//       "channels.bitrix24.groupPolicy": "disabled",
-//       "channels.bitrix24.bot.code": "openclaw_bot",
-//       "channels.bitrix24.bot.name": "Assistant",
-//       "channels.bitrix24.bot.color": "PURPLE",
-//       "channels.bitrix24.bot.workPosition": "AI Assistant",
-//       "channels.bitrix24.poll.idleMs": 15000,
-//       "channels.bitrix24.poll.activeMs": 3000
-//     }'
+//     run --rm openclaw-cli config set --batch-json '[
+//       {"path": "plugins.load.paths", "value": ["/opt/plugins/bitrix24"]},
+//       {"path": "plugins.entries.bitrix24.enabled", "value": true},
+//       {"path": "channels.bitrix24.enabled", "value": false},
+//       {"path": "channels.bitrix24.webhookUrl", "value": {"source": "env", "provider": "default", "id": "BITRIX24_WEBHOOK_URL"}},
+//       {"path": "channels.bitrix24.botToken", "value": {"source": "env", "provider": "default", "id": "BITRIX24_BOT_TOKEN"}},
+//       {"path": "channels.bitrix24.portalDomain", "value": "example.bitrix24.eu"},
+//       {"path": "channels.bitrix24.dmPolicy", "value": "allowlist"},
+//       {"path": "channels.bitrix24.allowFrom", "value": []},
+//       {"path": "channels.bitrix24.groupPolicy", "value": "disabled"}
+//     ]'
 //
 // Enabling the channel is a SEPARATE, later, explicitly approved step:
 //
-//   ... config set --batch-json '{"channels.bitrix24.enabled": true}'
+//   ... config set channels.bitrix24.enabled true
 // ---------------------------------------------------------------------------

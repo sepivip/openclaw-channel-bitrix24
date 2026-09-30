@@ -12,7 +12,7 @@
 #   * a named volume `openclaw-plugins` holding the BUILT plugin
 #     (populated by scripts/sync-plugin-to-volume.sh)
 #   * a READ-ONLY mount of that volume on the gateway
-#   * two env passthroughs for the SecretInput `${...}` shorthand
+#   * two env passthroughs for the env SecretRefs in channels.bitrix24
 #
 # What it deliberately does NOT add: no new service, no new published port.
 # There is no inbound HTTP surface.
@@ -26,7 +26,7 @@ services:
     volumes:
       - openclaw-plugins:/opt/plugins:ro
     environment:
-      # Consumed only by the SecretInput shorthand in channels.bitrix24.
+      # Consumed only by the env SecretRefs in channels.bitrix24.
       # Empty by default: an empty value is treated as MISSING and the account
       # refuses to start (fail-closed).
       BITRIX24_WEBHOOK_URL: ${BITRIX24_WEBHOOK_URL:-}
@@ -34,7 +34,7 @@ services:
 
   # The CLI sidecar needs the SAME mount and env: `openclaw config set/validate`
   # run inside a fresh openclaw-cli container and check that every
-  # `plugins.load.paths` entry exists and every `${ENV}` SecretRef resolves.
+  # `plugins.load.paths` entry exists and every env SecretRef resolves.
   openclaw-cli:
     volumes:
       - openclaw-plugins:/opt/plugins:ro
